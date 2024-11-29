@@ -24,4 +24,9 @@
 ---
 #### Conduct the associations between metabolite ratios and asthma-related phenotypes in ODOLLFA (replication):
 #### 7_ODOLLFA_targeted_ratio_association.Rmd
-
+---
+#### Build the prediction model for asthma exacerbation based on metabolite ratios in MGB-KAS:
+#### 8_MGB_KAS_targeted_ratio_prediction.Rmd
+---
+#### Replicate the prediction model for asthma exacerbation based on metabolite ratios in ODOLLFA:
+#### 9_ODOLLFA_ratio_prediction.Rmd
