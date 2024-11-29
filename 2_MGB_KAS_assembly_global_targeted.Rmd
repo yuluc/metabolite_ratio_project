@@ -1,0 +1,622 @@
+---
+title: "PEGASUS Metabolomics - Assembly & Exploratory Data Analysis"
+subtitle: "global and targeted mets"
+author: "Yulu Chen and Mengna Huang"
+date: "10/22/2023"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+
+## Packages
+
+pkg <- c("tidyverse", "data.table", "here", "readxl", "e1071", "table1")
+for (p in pkg) {
+        if (require(p, character.only = T)) {
+                print(paste0(p, " loaded successfully"))
+        } else {
+                install.packages(p)
+                require(p, character.only = T)
+                print(paste0(p, " downloaded and loaded successfully"))
+        }
+}
+
+
+## Paths
+
+pegasus_dir <- "/udd/reyul/mets_ratio_CodeReview/data/PEGASUS/"
+met_dir <- str_c(pegasus_dir, "1_global_mets_post_qc/")
+pheno_dir <- str_c(pegasus_dir, "rpdr_wrangling/")
+
+dat_dir <- str_c(pegasus_dir, "2_assembly_global_targeted/")
+
+
+## Filenames
+
+all_subj_fname <- str_c(pheno_dir, "all_subj_enc_bmi.csv")
+med_cs_fname <- str_c(pheno_dir, "med_corticosteroids_summary.csv")
+wbc_fname <- str_c(pheno_dir, "wbc_count_closest_to_serum_collection.csv")
+exac_fname <- str_c(pheno_dir, "asthma_exacerbation_summary.csv")
+comorb_fname <- str_c(pheno_dir, "comorbidities_of_interest.csv")
+pft_fname <- str_c(pheno_dir, "pft_prebronchodilator_closest_to_serum_collection.csv")
+ige_fname <- str_c(pheno_dir, "ige_closest_to_serum_collection.csv")
+allergy_fname <- str_c(pheno_dir, "ige_high_env_allergy_ever.csv")
+
+hilic_pos_fname <- str_c(met_dir, "hilic_pos_outlier_checked/processed_hilic_pos_halfmin.RData")
+lipid_pos_fname <- str_c(met_dir, "lipid_pos/processed_lipid_pos_halfmin.RData")
+lipid_neg_fname <- str_c(met_dir, "lipid_neg/processed_lipid_neg_halfmin.RData")
+
+sph_fname <- str_c(pegasus_dir, "targeted_sphingolipids/eda_updated.RData")
+
+microb_mets_fname <- str_c(pegasus_dir, "targeted_microb/PR003-21_AsthmaCohort1125_MicrobiomePanel_CDT_Test.xlsx")
+microb_link_id_fname <- str_c(pegasus_dir, "targeted_microb/list_of_BIOBANK_samples.csv")
+
+steroid_fname <- str_c(pegasus_dir, "targeted_steroids/PR005-21_AsthmaCohort1125_Steroids_CDT_062821.xlsx")
+steroid_link_id_fname <- str_c(pegasus_dir, "targeted_steroids/BIOBANK_Serum_manifest.xlsx")
+
+## Hard-coded numbers
+
+missing_thld <- 0.30
+
+```
+
+# 1. Phenotype/EMR data
+
+```{r}
+
+all_subj <- fread(all_subj_fname)
+all_subj[, Collect_Date := as.Date(Collect_Date, format = "%Y-%m-%d")]
+all_subj[, .N, .(is.na(EMPI), is.na(Collect_Date))][order(is.na, is.na.1)] %>% 
+        setnames(., c("missing_EMPI", "missing_Collect_Date", "N")) %>% print()
+all_subj[, asthma_num := case_when(Asthma_Status == TRUE ~ 1, 
+                                   Asthma_Status == FALSE ~ 0)]
+
+stratum_to_rm <- all_subj[is.na(EMPI) | is.na(Collect_Date), unique(Stratum)]; length(stratum_to_rm)
+all_subj <- all_subj[!(Stratum %in% stratum_to_rm), ]
+
+med_cs <- fread(med_cs_fname)
+pheno <- merge(all_subj, med_cs, by = c("EMPI", "SampleGroup"), all.x = T)
+
+comorb <- fread(comorb_fname)
+pheno <- merge(pheno, comorb[!is.na(EMPI), ], by = c("EMPI"), all.x = T)
+
+wbc <- fread(wbc_fname)
+pheno <- merge(pheno, wbc, by = c("EMPI"), all.x = T)
+
+exac <- fread(exac_fname)
+pheno <- merge(pheno, exac, by = c("EMPI", "SampleGroup"), all.x = T)
+
+pft <- fread(pft_fname)
+pheno <- merge(pheno, pft, by = c("EMPI", "SampleGroup"), all.x = T)
+
+ige <- fread(ige_fname)
+pheno <- merge(pheno, ige, by = c("EMPI"), all.x = T)
+
+allergy <- fread(allergy_fname)
+pheno <- merge(pheno, allergy, by = c("EMPI"), all.x = T)
+
+pheno[, ':='(race = case_when(Race %in% c("White", "Black") ~ Race, 
+                              TRUE ~ "Other"), 
+             fev1fvc_prebd_pctpred = fev1_prebd_pctpred / fvc_prebd_pctpred)]
+
+save(pheno, file = here(dat_dir, "pheno.RData"))
+
+```
+
+# 2. HILIC-positive halfmin imputed data (outlier checked)
+
+```{r}
+
+load(hilic_pos_fname, verbose = T)
+hilic_pos_dat <- copy(samp_dat_final)
+hilic_pos_mets_info <- copy(mets_info)
+hilic_pos_mets_cols <- copy(samp_mets_cols)
+
+hilic_pos_mets_info[, .N, pct_na_met <= missing_thld]
+
+
+## Create another unique feature identifier to avoid possible repeated IDs with other platform
+
+setnames(hilic_pos_dat, hilic_pos_mets_cols, str_c(hilic_pos_mets_cols, "_hilic_pos"))
+hilic_pos_mets_info[, feat_id := str_c(feature, "_hilic_pos")]
+hilic_pos_mets_cols <- str_c(hilic_pos_mets_cols, "_hilic_pos")
+
+
+## Manually annotate cortisol (F1381, confirmed with standard by Pei)
+
+hilic_pos_mets_info[feature == "F1381", tentative_annotation := "Cortisol"]
+
+
+## Add indicators for platform, medication & without MS2
+
+hilic_pos_mets_info[, platform := "HILIC-pos"]
+
+meds_string <- str_c("Flutrimazole|Bezafibrate|Esomeprazole|Levocetirizine|Paracetamol|Irbesartan|",
+                     "Gabapentin|Fexofenadine|Isosorbide|Lisofylline|Venlafaxine|Nortriptyline|Metformin|", 
+                     "Escitalopram|Methocarbamol|Dantrolene|Trimethoprim|Sulfamethoxazole|Thioguanine|", 
+                     "Thalidomide|Diazepam|Trazodone|Levetiracetam|Diltiazem|Fenoterol|Eflornithine|", 
+                     "Carbetapentane|Fluoxetine|Fluconazole|Metronidazole|Valsartan|Warfarin")
+
+hilic_pos_mets_info[tentative_annotation != "Unknown", 
+                    ':='(wo_ms2 = case_when(grepl("(?i)w/o ms2", tentative_annotation) ~ 1, 
+                                            TRUE ~ 0), 
+                         med_feat = case_when(grepl(meds_string, tentative_annotation, ignore.case = T) ~ 1, 
+                                              TRUE ~ 0))]
+
+
+## Remove original metabolomic data files with non-specific names
+
+rm(mets_info, samp_dat_final, samp_dat_origscale, samp_na, samp_mets_cols)
+save(hilic_pos_dat, hilic_pos_mets_info, hilic_pos_mets_cols, 
+     file = here(dat_dir, "hilic_pos_data_updated.RData"))
+
+```
+
+# 3. Lipidomics-positive halfmin imputed data 
+
+```{r}
+
+load(lipid_pos_fname, verbose = T)
+setnames(samp_dat_final, "Group", "SampleGroup")
+lipid_pos_dat <- copy(samp_dat_final)
+lipid_pos_mets_info <- copy(mets_info)
+lipid_pos_mets_cols <- copy(samp_mets_cols)
+
+lipid_pos_mets_info[, .N, pct_na_met <= missing_thld]
+
+
+## Create another unique feature identifier to avoid possible repeated IDs with other platform
+
+setnames(lipid_pos_dat, lipid_pos_mets_cols, str_c(lipid_pos_mets_cols, "_lipid_pos"))
+lipid_pos_mets_info[, feat_id := str_c(feature, "_lipid_pos")]
+lipid_pos_mets_cols <- str_c(lipid_pos_mets_cols, "_lipid_pos")
+
+
+## Manually annotate mouse/cell feature to unknown
+
+lipid_pos_mets_info[grepl("(?i)mouse|cell", tentative_annotation), tentative_annotation := "Unknown"]
+
+
+## Add indicators for platform & without MS2
+
+lipid_pos_mets_info[, platform := "Lipid-pos"]
+
+lipid_pos_mets_info[tentative_annotation != "Unknown", 
+                    ':='(wo_ms2 = case_when(grepl("(?i)w/o ms2", tentative_annotation) ~ 1, 
+                                            TRUE ~ 0), 
+                         med_feat = 0)] 
+
+
+## Remove original metabolomic data files with non-specific names
+
+rm(mets_info, samp_dat_final, samp_dat_origscale, samp_na, samp_mets_cols)
+save(lipid_pos_dat, lipid_pos_mets_info, lipid_pos_mets_cols, 
+     file = here(dat_dir, "lipid_pos_data_updated.RData"))
+
+```
+
+# 4. Lipidomics-negative halfmin imputed data 
+
+```{r}
+
+load(lipid_neg_fname, verbose = T)
+lipid_neg_dat <- copy(samp_dat_final)
+lipid_neg_mets_info <- copy(mets_info)
+lipid_neg_mets_cols <- copy(samp_mets_cols)
+
+lipid_neg_mets_info[, .N, pct_na_met <= missing_thld]
+
+
+## Create another unique feature identifier to avoid possible repeated IDs with other platform
+
+setnames(lipid_neg_dat, lipid_neg_mets_cols, str_c(lipid_neg_mets_cols, "_lipid_neg"))
+lipid_neg_mets_info[, feat_id := str_c(feature, "_lipid_neg")]
+lipid_neg_mets_cols <- str_c(lipid_neg_mets_cols, "_lipid_neg")
+
+
+## Manually annotate mouse/cell feature to unknown
+
+lipid_neg_mets_info[grepl("(?i)mouse|cell", tentative_annotation), tentative_annotation := "Unknown"]
+
+
+## Add indicators for platform & without MS2
+
+lipid_neg_mets_info[, platform := "Lipid-neg"]
+
+lipid_neg_mets_info[tentative_annotation != "Unknown", 
+                    ':='(wo_ms2 = case_when(grepl("(?i)w/o ms2", tentative_annotation) ~ 1, 
+                                            TRUE ~ 0), 
+                         med_feat = 0)] 
+
+
+## Remove original metabolomic data files with non-specific names
+
+rm(mets_info, samp_dat_final, samp_dat_origscale, samp_na, samp_mets_cols)
+save(lipid_neg_dat, lipid_neg_mets_info, lipid_neg_mets_cols, 
+     file = here(dat_dir, "lipid_neg_data_updated.RData"))
+
+```
+
+# 5. Targeted sphingolipids data
+
+```{r}
+
+load(sph_fname, verbose = T)
+setnames(mets_pheno, c("Group", "Original_Spl_ID"), c("SampleGroup", "sampleID_biobank"))
+sph_dat <- copy(mets_pheno)
+sph_mets_info <- copy(mets_info)
+sph_mets_cols <- copy(sph_list)
+
+sph_mets_info[, .N, pct_na_met <= missing_thld]
+sph_mets_info[, summary(pct_na_met)]
+
+
+## Standardize sphingolipids
+
+sph_dat_orig <- copy(sph_dat)
+sph_dat[, (sph_mets_cols) := lapply(.SD, function(x) scale(x, center = T, scale = T)), 
+        .SDcols = sph_mets_cols]
+
+
+## Add indicators for platform & without MS2
+
+sph_mets_info[, ':='(feature = metabolite, 
+                     tentative_annotation = metabolite, 
+                     platform = "Targeted-sphingolipids", 
+                     wo_ms2 = 0, 
+                     med_feat = 0, 
+                     rt_min = NA, 
+                     mz = NA, 
+                     cv = NA, 
+                     skewness_post = skewness_met)][, feat_id := feature] 
+# The annotations are accurate - only duplicating for programing purpose
+
+
+## Remove original metabolomic data files with non-specific names
+
+rm(mets_pheno, mets_info, sph_list, sphoth_list, sm_list, cer_list, ceroth_list)
+save(sph_dat, sph_mets_info, sph_mets_cols, sph_dat_orig, 
+     file = here(dat_dir, "sph_data_updated.RData"))
+
+```
+
+# 6. Targeted microbial metabolites data (Precion)
+
+```{r}
+
+link_id <- fread(microb_link_id_fname)
+setnames(link_id, "SUBJ_ALIASID", "Biobank_Subject_ID")
+# link_id[, .N, Biobank_Subject_ID][N == 2] 
+# Remvoe duplicated records for this subject
+link_id <- link_id[!duplicated(Biobank_Subject_ID), ]
+
+microb_mets <- read_xlsx(microb_mets_fname) %>% as.data.table()
+setnames(microb_mets, gsub("[ ()/]", "_", colnames(microb_mets)))
+microb_mets[, feat_id := str_c("X", seq(1, .N), "_microb")]
+setcolorder(microb_mets, "feat_id")
+microb_mets_info <- microb_mets[, c(1:which(colnames(microb_mets) == "ALOQ__ug_mL_")), with = F]
+microb_mets_cols <- microb_mets_info$feat_id
+
+subj_cols <- colnames(microb_mets)[-c(2:which(colnames(microb_mets) == "ALOQ__ug_mL_"))]
+microb_mets_dat <- microb_mets[, ..subj_cols] %>% as.data.frame() 
+rownames(microb_mets_dat) <- microb_mets_dat$feat_id
+microb_mets_dat$feat_id <- NULL
+microb_mets_dat <- t(microb_mets_dat) %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+setnames(microb_mets_dat, "rowname", "S_SAMPLEID")
+
+microb_mets_dat[, (microb_mets_cols) := lapply(.SD, as.character), .SDcols = microb_mets_cols]
+suppressWarnings(microb_mets_dat[, (microb_mets_cols) := lapply(.SD, as.numeric), .SDcols = microb_mets_cols])
+microb_mets_dat <- merge(microb_mets_dat, link_id[, .(Biobank_Subject_ID, S_SAMPLEID)], by = "S_SAMPLEID")
+
+microb_mets_info[, .N, .(SUB_PATHWAY, SUPER_PATHWAY)]
+microb_mets_info[SUB_PATHWAY == "polyamine metabolism", SUB_PATHWAY := "Polyamine Metabolism"]
+
+
+## Create a variable for tryptophan/kynurenine ratio
+
+microb_mets_dat[, ':='(trypkynu_ratio_microb = X66_microb / X41_microb)]
+ggplot(microb_mets_dat) + 
+        geom_histogram(aes(trypkynu_ratio_microb), bins = 100) + 
+        labs(title = "Microbial metabolites - tryptophan/kynurenine ratio distribution")
+microb_mets_cols <- c(microb_mets_cols, "trypkynu_ratio_microb")
+microb_mets_info <- rbind(microb_mets_info, 
+                          t(c("trypkynu_ratio_microb", "tryptophan/kynurenine ratio", "microbiome metabolism", 
+                              "Tryptophan Metabolism", NA, NA, NA, NA, NA, NA, NA)), use.names = F)
+
+
+## Missingness
+
+mets_missing <- microb_mets_dat[, lapply(.SD, function(x) mean(is.na(x))), .SDcols = microb_mets_cols] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_missing, c("feat_id", "pct_na_met"))
+microb_mets_info <- merge(microb_mets_info, mets_missing, by = "feat_id")
+microb_mets_info[, summary(pct_na_met)]
+microb_mets_info[, .N, pct_na_met <= missing_thld]
+ggplot(microb_mets_info) + 
+        geom_histogram(aes(pct_na_met), bins = 50) + 
+        labs(title = "Microbial metabolites missingness")
+
+
+## Skewness
+
+mets_skewness <- microb_mets_dat[, lapply(.SD, function(x) skewness(is.na(x))), .SDcols = microb_mets_cols] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_skewness, c("feat_id", "skewness_met"))
+microb_mets_info <- merge(microb_mets_info, mets_skewness, by = "feat_id")
+microb_mets_info[, summary(skewness_met)]
+ggplot(microb_mets_info) + 
+        geom_histogram(aes(skewness_met), bins = 50) + 
+        labs(title = "Microbial metabolites skewness")
+
+
+## Standardize microbial metabolites
+
+microb_mets_dat_orig <- copy(microb_mets_dat)
+microb_mets_dat[, (microb_mets_cols) := lapply(.SD, function(x) scale(x, center = T, scale = T)), 
+                .SDcols = microb_mets_cols]
+
+
+## Add indicators for platform & without MS2
+
+microb_mets_info[, ':='(feature = feat_id, 
+                        tentative_annotation = Component_Name, 
+                        platform = "Targeted-microbial-mets", 
+                        wo_ms2 = 0, 
+                        med_feat = 0, 
+                        rt_min = NA, 
+                        mz = NA, 
+                        cv = NA, 
+                        skewness_post = skewness_met)] 
+# The annotations are accurate - only duplicating for programing purpose
+
+save(microb_mets_dat, microb_mets_info, microb_mets_cols, microb_mets_dat_orig, 
+     file = here(dat_dir, "microb_data_updated.RData"))
+
+```
+
+# 7. Targeted steroids data (Precion)
+```{r}
+link_id <- read_xlsx(steroid_link_id_fname, sheet = 1) %>% as.data.table()
+link_id <- link_id[,c(3,5)]
+colnames(link_id) <- c("sampleID_biobank", "Biobank_Subject_ID")
+link_id$Biobank_Subject_ID <- as.integer(as.character(link_id$Biobank_Subject_ID))
+
+steroid_df <- read_xlsx(steroid_fname, sheet = 1) %>% as.data.table()
+
+# keep an orginal file
+steroid_df_orig <- copy(steroid_df)
+
+# add a feat id and feature
+steroid_df[, ':=' (feature = str_c("S", seq(1, .N)),
+                   feat_id = str_c("S", seq(1, .N), "_steroid"))]
+
+# extract the steroid information
+str_mets_info <- steroid_df[, c("feat_id", "feature", "Component Name", "SUPER PATHWAY", "SUB PATHWAY", "CAS", "PUBCHEM", "CHEMSPIDER", "KEGG", "HMDB ID", "LLOQ (ng/mL)", "ALOQ (ng/mL)")]
+
+# transpose the steroid data
+steroid_dat <- steroid_df[, c(11:1135)]
+steroid_dat <- as.data.frame(t(steroid_dat))
+colnames(steroid_dat) <- steroid_df$feat_id
+
+# change NQ to be NA
+steroid_dat[steroid_dat == "NQ"] <- NA
+
+#
+steroid_dat[] <- lapply(steroid_dat, function(x) as.numeric(as.character(x)))
+steroid_dat <- as.data.frame(cbind(rownames(steroid_dat), steroid_dat))
+colnames(steroid_dat)[1] <- "sampleID_biobank"
+steroid_dat <- as.data.table(steroid_dat)
+steroid_dat <- merge(steroid_dat, link_id, by = "sampleID_biobank", all.x = T)
+
+steroid_mets_cols <- str_mets_info$feat_id
+
+# Missingness
+# pct_na_str_mets <- colMeans(is.na(steroid_dat[,c(2:19)]))
+mets_missing <- steroid_dat[, lapply(.SD, function(x) mean(is.na(x))), .SDcols = steroid_mets_cols] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_missing, c("feat_id", "pct_na_met"))
+str_mets_info <- merge(str_mets_info, mets_missing, by = "feat_id")
+str_mets_info[, summary(pct_na_met)]
+str_mets_info[, .N, pct_na_met <= missing_thld]
+ggplot(str_mets_info) + 
+        geom_histogram(aes(pct_na_met), bins = 50) + 
+        labs(title = "Targeted steroids missingness")
+
+## Skewness
+
+mets_skewness <- steroid_dat[, lapply(.SD, function(x) skewness(is.na(x))), .SDcols = steroid_mets_cols] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_skewness, c("feat_id", "skewness_met"))
+str_mets_info <- merge(str_mets_info, mets_skewness, by = "feat_id")
+str_mets_info[, summary(skewness_met)]
+ggplot(str_mets_info) + 
+        geom_histogram(aes(skewness_met), bins = 50) + 
+        labs(title = "Targeted steroid skewness")
+
+## Standardize targeted steroids
+steroid_dat[, (steroid_mets_cols) := lapply(.SD, function(x) scale(x, center = T, scale = T)), 
+                .SDcols = steroid_mets_cols]
+
+
+# add more information for platform & without MS2
+str_mets_info[, ':='(tentative_annotation = `Component Name`, 
+                     platform = "Targeted-steroids", 
+                     wo_ms2 = 0, 
+                     med_feat = 0, 
+                     rt_min = NA, 
+                     mz = NA, 
+                     cv = NA, 
+                     skewness_post = skewness_met)]
+
+
+
+# save targeted steroid file
+save(steroid_dat, str_mets_info, steroid_mets_cols, steroid_df_orig, 
+     file = here(dat_dir, "str_data_updated.RData"))
+
+```
+
+
+# 8. Merge data from all platforms
+
+```{r}
+
+## Merge pheno with metabolomic data
+
+rm_cols <- c("Order", "Batch", "RunID", "SampleType", "QC", "Idx", "BiobankSubjectID", "SampleID", 
+             "HILICPOS_dataFileName", str_c("PC", 1:10))
+hilic_pos_dat <- hilic_pos_dat[, (rm_cols) := NULL]
+pheno_mets <- merge(pheno, hilic_pos_dat, 
+                    by = c("sampleID_biobank", "SampleGroup", "Match_ID", "Asthma_Status", 
+                           "Age", "Gender", "Race", "BMI", "Nonsmoker"), 
+                    all.x = T)
+
+rm_cols <- c("Order", "Batch", "RunID", "SampleType", "QC", "Idx", "BiobankSubjectID", "SampleID", 
+             "FileName", str_c("PC", 1:10))
+lipid_pos_dat <- lipid_pos_dat[, (rm_cols) := NULL]
+pheno_mets <- merge(pheno_mets, lipid_pos_dat, 
+                    by = c("sampleID_biobank", "SampleGroup", "Match_ID", "Asthma_Status", 
+                           "Age", "Gender", "Race", "BMI", "Nonsmoker"), 
+                    all.x = T)
+
+lipid_neg_dat <- lipid_neg_dat[, (rm_cols) := NULL]
+pheno_mets <- merge(pheno_mets, lipid_neg_dat, 
+                    by = c("sampleID_biobank", "SampleGroup", "Match_ID", "Asthma_Status", 
+                           "Age", "Gender", "Race", "BMI", "Nonsmoker"), 
+                    all.x = T)
+
+pheno_mets <- merge(pheno_mets, subset(sph_dat, select = c("sampleID_biobank", sph_mets_cols)), 
+                    by = "sampleID_biobank", all.x = T)
+
+pheno_mets <- merge(pheno_mets, microb_mets_dat, by = c("Biobank_Subject_ID"), all.x = T)
+
+## subject 10009114 has duplicated steroid measure so I remove this subjects
+steroid_dat <- steroid_dat[!(Biobank_Subject_ID == 10009114),]
+
+pheno_mets <- merge(pheno_mets, steroid_dat, by = c("Biobank_Subject_ID"), all.x = T)
+
+## change the race and ethnicity
+pheno_mets$Race_3cat <- with(pheno_mets, ifelse(Race == "White", "White", 
+                                         ifelse(Race == "Black", "Black", "Others")))
+
+pheno_mets$Ethnicity_2cat <- with(pheno_mets, ifelse(Ethnicity == "Hispanic", "Hispanic", "Non-Hispanic"))
+
+## Concatenate mets info
+
+mets_info_cols <- c("feat_id", "feature", "tentative_annotation", "platform", "wo_ms2", "med_feat", 
+                    "rt_min", "mz", "cv", "pct_na_met", "skewness_post")
+mets_info_all <- rbind(hilic_pos_mets_info[, ..mets_info_cols], lipid_pos_mets_info[, ..mets_info_cols], 
+                       lipid_neg_mets_info[, ..mets_info_cols], sph_mets_info[, ..mets_info_cols], 
+                       microb_mets_info[, ..mets_info_cols], str_mets_info[, ..mets_info_cols])
+nrow(mets_info_all) == length(unique(mets_info_all$feat_id)) 
+
+
+## Generate list of metabolite column names for later analysis
+
+mets_list_analysis <- c(hilic_pos_mets_info[is.na(qc_rm) & pct_na_met <= missing_thld, feat_id], 
+                        lipid_pos_mets_info[is.na(qc_rm) & pct_na_met <= missing_thld, feat_id], 
+                        lipid_neg_mets_info[is.na(qc_rm) & pct_na_met <= missing_thld, feat_id], 
+                        sph_mets_info[pct_na_met <= missing_thld, feat_id], 
+                        microb_mets_info[pct_na_met <= missing_thld, feat_id],
+                        str_mets_info[pct_na_met <= missing_thld, feat_id])
+length(mets_list_analysis) #6997
+
+
+
+```
+
+# 9. Add global annotation
+```{r}
+annot_hilic_pos <- read_excel(str_c(pegasus_dir, "global_annotation/PEGASuS_Annotations_PeiZhang_MH.xlsx"), sheet = "HILIC_POS") %>% as.data.table()
+
+annot_lipid_neg <- read_excel(str_c(pegasus_dir, "global_annotation/PEGASuS_Annotations_PeiZhang_MH.xlsx"), sheet = "LIPIDOMICS_NEG") %>% as.data.table()
+
+annot_lipid_pos <- read_excel(str_c(pegasus_dir, "global_annotation/PEGASuS_Annotations_PeiZhang_MH.xlsx"), sheet = "LIPIDOMICS_POS") %>% as.data.table()
+
+# add the annotation information to the global metabolomics
+
+annot <- as.data.frame(rbind(annot_hilic_pos, annot_lipid_neg, annot_lipid_pos))
+annot <- as.data.table(annot)
+
+annot$feat_id <- with(annot, ifelse(platform == "Lipid-pos", str_c(feature, "_lipid_pos"), ifelse(
+  platform == "Lipid-neg", str_c(feature, "_lipid_neg"), str_c(feature, "_hilic_pos")
+)))
+
+annot <- annot[, -c("feature", "tentative_annotation", "platform", "rt_min", "mz", "beta", "pval", "fdr_bh")]
+
+mets_info_all <- merge(mets_info_all, annot, by = "feat_id", all.x = T)
+```
+
+# 10. Add phenotypes from RPDR (from Qingwen)
+```{r}
+pheno_rpdr <- fread(str_c(pegasus_dir, "rpdr_qingwen/PEGASUS_pheno.csv"))
+
+pheno_rpdr$`FEV1_FVC_most_recent` <- (pheno_rpdr$FEV1_most_recent)/(pheno_rpdr$FVC_most_recent)
+
+pheno_rpdr$`FEV1_FVC_median_6M` <- (pheno_rpdr$FEV1_median_6M)/(pheno_rpdr$FVC_median_6M)
+
+pheno_rpdr$`FEV1_FVC_median_12M` <- (pheno_rpdr$FEV1_median_12M)/(pheno_rpdr$FVC_median_12M)
+
+pheno_rpdr$`FEV1_FVC_median_24M` <- (pheno_rpdr$FEV1_median_24M)/(pheno_rpdr$FVC_median_24M)
+
+which(colnames(pheno_rpdr) == "Subject_ID")
+colnames(pheno_rpdr)[10] <- "Biobank_Subject_ID"
+
+# Add Qingwen's RPDR data
+col.name_1 <- colnames(pheno_mets)
+col.name_2 <- colnames(pheno_rpdr)
+col.name_3 <- col.name_2[!(col.name_2 %in% col.name_1)]
+col.name_3 <- append("Biobank_Subject_ID", col.name_3)
+
+pheno_mets <- merge(pheno_mets, pheno_rpdr[,..col.name_3], by = "Biobank_Subject_ID", all.x = T)
+
+```
+
+# 11. Add ics and ocs use 
+```{r}
+# ICS and OCS after sample collection
+med_after_df <- fread(str_c(pheno_dir, "med_corticosteroids_after_sample_collection_summary.csv"))
+colnames(med_after_df)[2:19] <-paste(colnames(med_after_df)[2:19], "after",sep="_")
+med_after_df <- med_after_df[,-20]
+
+ics_after_df <- fread(str_c(pheno_dir, "med_first_ics_after_sample_collection.csv"))
+ics_after_df <- ics_after_df[,c("EMPI", "Medication_Date", "Collect_Date", "ics", "cs_timegap_d", "cs_timegap_y")]
+colnames(ics_after_df)[2:6] <-paste(colnames(ics_after_df)[2:6], "ics_after",sep="_")
+
+ocs_after_df <- fread(str_c(pheno_dir, "med_first_ocs_after_sample_collection.csv"))
+ocs_after_df <- ocs_after_df[,c("EMPI", "Medication_Date", "Collect_Date", "ocs", "cs_timegap_d", "cs_timegap_y")]
+colnames(ocs_after_df)[2:6] <-paste(colnames(ocs_after_df)[2:6], "ocs_after",sep="_")
+
+# Add ICS and OCS data after collection date
+pheno_mets <- merge(pheno_mets, med_after_df, by = "EMPI", all.x = T)
+pheno_mets <- merge(pheno_mets, ics_after_df, by = "EMPI", all.x = T)
+pheno_mets <- merge(pheno_mets, ocs_after_df, by = "EMPI", all.x = T)
+```
+
+# 12. Save merge data
+
+```{r}
+
+save(pheno_mets, mets_info_all, mets_list_analysis, 
+     hilic_pos_mets_info, lipid_pos_mets_info, lipid_neg_mets_info, sph_mets_info, microb_mets_info, str_mets_info,
+     file = here(dat_dir, "all_platforms_data_updated.RData"))
+
+```
+
+
+# Session info
+
+```{r}
+
+timestamp()
+sessionInfo()
+
+```
