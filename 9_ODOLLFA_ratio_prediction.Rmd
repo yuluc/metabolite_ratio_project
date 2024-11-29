@@ -1,0 +1,2266 @@
+---
+title: "Ratio associations in ODOLLFA&PHASIC"
+subtitle: "ICS and OCS use after sample collection & Remove people with COPD or smoker"
+author: "Yulu Chen"
+date: "04/03/2023"
+output:   
+  html_document: 
+    toc: yes
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+
+## Packages
+
+pkg <- c("tidyverse", "data.table", "here", "survival", "gtools", "tableone", "DT", "sjPlot", 
+         "sjmisc", "grid", "gridExtra", "ggpubr", "table1", "xlsx",
+         "ggvenn", "readxl", "pheatmap","ggrepel", "Hmisc", "survival", "ggsurvfit",
+         "ggfortify", "gtsummary", "survminer", "pROC", "mltools")
+for (p in pkg) {
+        if (require(p, character.only = T)) {
+                print(paste0(p, " loaded successfully"))
+        } else {
+                install.packages(p)
+                require(p, character.only = T)
+                print(paste0(p, " downloaded and loaded successfully"))
+        }
+}
+
+
+## Paths
+
+fig_dir <- "figures/2_2"
+res_dir <- "results/2_2"
+pre_dat_dir <- "data/pre"
+after_dat_dir <- "data/after"
+
+
+## Hard-coded numbers
+
+missing_thld <- 0.30
+alpha_thld <- 0.05
+z_95 <- qnorm(p = 0.975)
+
+
+## Functions
+
+save_pheatmap_png <- function(x, filename, width = 16, height = 16, units = "in", res = 300) {
+        png(filename, width = width, height = height, units = units, res = res)
+        grid::grid.newpage()
+        grid::grid.draw(x$gtable)
+        dev.off()
+}
+
+## Fit a survival model
+surv_model <- function(time, event, exposure, add.covs, data){
+  formula_string <- sprintf("Surv(%s, %s) ~ %s + %s", time, event, exposure, paste0("Age_at_collect + BMI_most_recent + Gender + race + ", add.covs))  
+  formula_string <- as.formula(formula_string)
+  cox.model <- coxph(formula_string, data = data)
+  return(cox.model)
+}
+
+surv_model.2 <- function(time, event, add.covs, data){
+  formula_string <- sprintf("Surv(%s, %s) ~ %s", time, event, paste0("Age_at_collect + BMI_most_recent + Gender + race + ", add.covs))  
+  formula_string <- as.formula(formula_string)
+  cox.model <- coxph(formula_string, data = data)
+  return(cox.model)
+}
+
+
+## Generate tidy output from multiple models
+tidy_output <- function(exp_list, outcome, input_dt, cox.time=NULL, cox.event=NULL, add.covs=1){
+  N_list <- c()
+  n_list <- c()
+  beta_list <- c()
+  lower_list <- c()
+  upper_list <- c()
+  Cidx_list <- c()
+  C.ll_list <- c()
+  C.ul_list <- c()
+  PH.test_list <- c()
+  Chisq.pval_list <- c()
+  
+  model.spec = "Cox_ph"
+  
+  for (exp in exp_list) {
+    dt = copy(input_dt)
+    setnames(dt, exp, "exp")
+    dt = dt[!is.na(exp)]
+    
+    model.1 <- surv_model(cox.time, cox.event, "exp", add.covs, dt)
+    model.2 <- surv_model.2(cox.time, cox.event, add.covs, dt)
+    
+    PropHarzard.res = cox.zph(model.1)$table
+    PH.test_pval = PropHarzard.res[rownames(PropHarzard.res)=="exp"][3]
+    
+    model_output = summary(model.1)
+    
+    Chisq = abs(as.numeric(logLik(model.1) - logLik(model.2)) * 2)
+    Chisq.pval = pchisq(Chisq, 1, lower.tail=F)
+    
+    C.idx = model_output$concordance[1]
+    C.se = model_output$concordance[2]
+    C.ll = C.idx - 1.96*C.se
+    C.ul = C.idx + 1.96*C.se
+    
+    beta_list <- c(beta_list, model_output[["conf.int"]][1,1])
+    lower_list <- c(lower_list, model_output[["conf.int"]][1,3])
+    upper_list <- c(upper_list, model_output[["conf.int"]][1,4])
+    Chisq.pval_list <- c(Chisq.pval_list, Chisq.pval)
+    Cidx_list <- c(Cidx_list, C.idx)
+    C.ll_list <- c(C.ll_list, C.ll)
+    C.ul_list <- c(C.ul_list, C.ul)
+    PH.test_list <- c(PH.test_list, PH.test_pval)
+    
+    vars.selected = c("Biobank_Subject_ID", "exp", cox.event)
+    unique.dt = dt %>% select(all_of(vars.selected)) %>% distinct() %>% data.table()
+    freq_df <- table(unique.dt[, ..cox.event])
+    N_list = c(sum(freq_df), N_list)
+    n_list = c(freq_df[2], n_list)
+  }
+  
+  output_dt <- data.table(Health.Outcome=outcome, Sample_N=N_list, Event_n=n_list, Model.spec=model.spec, feat_id=exp_list, Beta=beta_list, LowerLimit=lower_list, UpperLimit=upper_list, Chisq.P.value=Chisq.pval_list, C.index=Cidx_list, C.LowerLimit=C.ll_list, C.UpperLimit=C.ul_list, ProportionalHazard.test.Pval=PH.test_list)
+  
+  return(output_dt)
+}
+
+pvalue <- function(x, ...) {
+    # Construct vectors of data y, and groups (strata) g
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        # For numeric variables, perform a standard 2-sample t-test
+        p <- as.data.frame(summary(aov(y ~ g))[[1]])[1,5]
+    } else {
+        # For categorical variables, perform a chi-squared test of independence
+        p <- chisq.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+```
+
+# 1. Load Data
+## 1.1 Read in selected pool (phenotypes)
+
+```{r}
+# ICS and OCS prior to sample collection
+med_cs_smry <- fread(here(pre_dat_dir, "med_corticosteroids_summary.csv")) %>% as.data.table()
+length(unique(med_cs_smry$Biobank_Subject_ID))
+
+# ICS and OCS after sample collection
+med_cs_smry_after <- fread(here(after_dat_dir, "med_corticosteroids_after_sample_collection_summary.csv")) %>% as.data.table()
+length(unique(med_cs_smry_after$Biobank_Subject_ID))
+length(unique(med_cs_smry_after$EMPI))
+length(intersect(med_cs_smry$EMPI, med_cs_smry_after$EMPI))
+med_cs_smry_after <- med_cs_smry_after[,c("EMPI", "Biobank_Subject_ID", "Collect_Date", 
+                                          "ics_trim_totnum", "ocs_trim_totnum", "ics_trim_totnum_1y", "ocs_trim_totnum_1y",
+                                          "ics_trim_totnum_2y", "ocs_trim_totnum_2y", "ics_trim_totnum_3y", "ocs_trim_totnum_3y",
+                                          "ics_trim_totnum_5y", "ocs_trim_totnum_5y", "ics_trim_totnum_10y", "ocs_trim_totnum_10y")]
+colnames(med_cs_smry_after)[4:15] <-paste(colnames(med_cs_smry_after)[4:15], "after",sep="_")
+
+ics_after_df <- fread(here(after_dat_dir, "med_first_ics_after_sample_collection.csv"))
+ics_after_df <- ics_after_df[,c("EMPI", "Medication_Date", "Collect_Date", "ics", "cs_timegap_d", "cs_timegap_y")]
+colnames(ics_after_df)[2:6] <-paste(colnames(ics_after_df)[2:6], "ics_after",sep="_")
+
+ocs_after_df <- fread(here(after_dat_dir, "med_first_ocs_after_sample_collection.csv"))
+ocs_after_df <- ocs_after_df[,c("EMPI", "Medication_Date", "Collect_Date", "ocs", "cs_timegap_d", "cs_timegap_y")]
+colnames(ocs_after_df)[2:6] <-paste(colnames(ocs_after_df)[2:6], "ocs_after",sep="_")
+
+#eth data
+eth_df <- fread("~/Dropbox (Partners HealthCare)/Personal/ODOLLFA/sample_selection/data/BiobankPortal_yc746_2022-01-10-205252_eth.csv") %>% as.data.table()
+eth_df <- eth_df[, -c(1,4)]
+colnames(eth_df)[1] <- "Biobank_Subject_ID"
+
+pool <- merge(med_cs_smry, eth_df, by = "Biobank_Subject_ID", all.x = T)
+
+pool <- merge(pool, med_cs_smry_after, by = c("EMPI", "Biobank_Subject_ID", "Collect_Date"))
+
+pool <- merge(pool, ics_after_df, by = "EMPI", all.x = T)
+pool <- merge(pool, ocs_after_df, by = "EMPI", all.x = T)
+
+```
+
+## 1.2 Load sample data
+```{r}
+sample_df <- read_excel("~/Dropbox (Partners HealthCare)/Shared Data/Metabolites/OODOLFA Mets_QC.xlsx", sheet = 1) %>% as.data.table()
+
+which(colnames(sample_df) == "CLIENT_SAMPLE_ID")
+colnames(sample_df)[9] <- "Biobank_Subject_ID"
+sample_df$Biobank_Subject_ID <- as.integer(sample_df$Biobank_Subject_ID)
+```
+
+## 1.3 Load Raw metabolon data
+```{r}
+
+mets_info <- read_excel("~/Dropbox (Partners HealthCare)/Shared Data/Metabolites/OODOLFA Mets_QC.xlsx", sheet = 2) %>% as.data.table()
+
+mets_raw_df <- read_excel("~/Dropbox (Partners HealthCare)/OODOLFA/Metabolomic Data/BRIG-02-22PHML+ DATA TABLES.xlsx", sheet = "Batch-normalized Data") %>% data.table()
+
+## add X to met ID
+mets_info$Name <- paste("X", mets_info$CHEM_ID, sep = "")
+
+colnames(mets_raw_df)[2:1729] <- paste("X", colnames(mets_raw_df)[2:1729], sep = "")
+
+## add biobank subject ID
+mets_raw_df <- merge(sample_df[,c("PARENT_SAMPLE_NAME", "Biobank_Subject_ID")], mets_raw_df, by = "PARENT_SAMPLE_NAME", all = T)
+
+## QC mets list
+mets_list <- mets_info[miss_flag == 0,]$Name
+```
+
+## 1.4 Load Qingwen's RPDR data (wait)
+```{r}
+pheno_odollfa_rpdr <- fread("~/Dropbox (Partners HealthCare)/Shared Data/Cohort Collection/ODOLLFA_pheno_mets.csv")
+pheno_phasic_rpdr <- fread("~/Dropbox (Partners HealthCare)/Shared Data/Cohort Collection/PHASIC_pheno_mets.csv")
+
+pheno_rpdr <- rbind(pheno_odollfa_rpdr, pheno_phasic_rpdr) %>% as.data.table()
+
+pheno_rpdr$`FEV1/FVC_median_6M` <- (pheno_rpdr$FEV1_median_6M)/(pheno_rpdr$FVC_median_6M)
+
+pheno_rpdr$`FEV1/FVC_median_12M` <- (pheno_rpdr$FEV1_median_12M)/(pheno_rpdr$FVC_median_12M)
+
+pheno_rpdr$`FEV1/FVC_median_24M` <- (pheno_rpdr$FEV1_median_24M)/(pheno_rpdr$FVC_median_24M)
+
+which(colnames(pheno_rpdr) == "EMPI")
+pheno_rpdr <- pheno_rpdr[,-c(2:1460)]
+
+which(colnames(pheno_rpdr) == "Subject_Id")
+colnames(pheno_rpdr)[7] <- "Biobank_Subject_ID"
+```
+
+
+## 1.5 Merge metabolon data to phenotypes
+```{r}
+# check the replicated samples
+n_occur <- data.frame(table(sample_df$Biobank_Subject_ID))
+table(n_occur$Freq)
+# n_occur[n_occur$Freq > 1,]
+dim(n_occur[n_occur$Freq > 1,])
+sample_df[sample_df$Biobank_Subject_ID %in% n_occur$Var1[n_occur$Freq > 1],]
+
+# remove the replicated sample
+unique_subject_list <- n_occur[n_occur$Freq < 2, ]$Var1 %>% as.character()
+
+mets_df_unique <- mets_raw_df[Biobank_Subject_ID %in% unique_subject_list,]
+
+# merge to phenotype data
+pool_df <- merge(pool, mets_df_unique, by = c("PARENT_SAMPLE_NAME", "Biobank_Subject_ID"), all.y = T)
+
+# # merge to Qingwen's data
+
+col.name_1 <- colnames(pool_df)
+col.name_2 <- colnames(pheno_rpdr)
+col.name_3 <- col.name_2[!(col.name_2 %in% col.name_1)]
+col.name_3 <- append("Biobank_Subject_ID", col.name_3)
+
+# pool_df <- merge(pool_df, pheno_rpdr, by = "Biobank_Subject_ID", all.x = T)
+
+pool_df_new <- merge(pool_df, pheno_rpdr[,..col.name_3], by = "Biobank_Subject_ID", all.x = T)
+
+# check the replicated samples
+n_occur <- data.frame(table(pool_df_new$Biobank_Subject_ID))
+table(n_occur$Freq)
+# n_occur[n_occur$Freq > 1,]
+dim(n_occur[n_occur$Freq > 1,])
+
+# remove the replicated sample
+# unique_subject_list <- n_occur[n_occur$Freq < 2, ]$Var1 %>% as.character()
+# pool_df_new <- pool_df_new[Biobank_Subject_ID %in% unique_subject_list,]
+
+# remove COPD and smokers
+pool_df_new[, .N, .(copd_existence)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+pool_df_new[, .N, .(Smoking_flag_Biobank)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+pool_df_new[, .N, .(smk_ever_alltime)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+pool_df_new[, .N, .(Smoking_RPDR_most_recent)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+pool_df_new[, .N, .(Smoking_RPDR_most_recent, Smoking_flag_Biobank)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+
+pool_df_new <- pool_df_new[pool_df_new$copd_existence != "Yes" & pool_df_new$Smoking_RPDR_most_recent != "Former-smoker" & pool_df_new$Smoking_RPDR_most_recent != "Current-smoker",]
+
+nrow(pool_df_new)
+
+pool_df_new[, .N, .(race)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+pool_df_new[, .N, .(Ethnicity)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pool_df_new$race <- with(pool_df_new, ifelse(race == "White", "White", 
+                                             ifelse(race == "Black", "Black", "Other")))
+pool_df_new[, .N, .(race)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pool_df_new[, .N, .(Ethnicity)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+```
+
+# 2. Create the ratio
+## 2.1 summary the subpathay
+```{r}
+mets_info_updated <- mets_info[Name %in% mets_list,]
+
+mets_info_subpathway <- mets_info_updated[, .N, .(SUB_PATHWAY)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 2, topn = 150)
+
+```
+
+## 2.2 sphingolipid list
+```{r}
+# sphingolipid
+## Sphingomyelins 29
+## Ceramides 10
+## Hexosylceramides (HCER) 6
+## Dihydrosphingomyelins 5
+## Sphingosines 3
+## Sphingolipid Synthesis 3
+## Lactosylceramides (LCER) 3
+## Dihydroceramides 2
+## Ceramide PEs 1
+
+sph_sub_pathway_list <- c("Sphingomyelins", "Ceramides", "Ceramide PEs", "Hexosylceramides (HCER)", "Dihydrosphingomyelins", "Sphingosines", "Sphingolipid Synthesis", "Lactosylceramides (LCER)", "Dihydroceramides")
+
+sph_mets_list <- mets_info_updated[SUB_PATHWAY %in% sph_sub_pathway_list,]$Name
+length(sph_mets_list)
+
+sph_mets_info <- mets_info_updated[SUB_PATHWAY %in% sph_sub_pathway_list,]
+setcolorder(sph_mets_info, c("SUPER_PATHWAY", "SUB_PATHWAY", "CHEMICAL_NAME"))
+
+```
+
+## 2.3 steroid list
+```{r}
+## Androgenic Steroids 24
+## Corticosteroids 7
+## Progestin Steroids 6
+## Estrogenic Steroids 1
+## Sterol 8
+
+str_sub_pathway_list <- c("Androgenic Steroids", "Corticosteroids", "Progestin Steroids", "Estrogenic Steroids", "Sterol")
+
+str_mets_list <- mets_info_updated[SUB_PATHWAY %in% str_sub_pathway_list,]$Name
+length(str_mets_list)
+
+str_mets_info <- mets_info_updated[SUB_PATHWAY %in% str_sub_pathway_list,]
+setcolorder(str_mets_info, c("SUPER_PATHWAY", "SUB_PATHWAY", "CHEMICAL_NAME"))
+
+```
+
+## 2.4 microbial list
+```{r}
+## sub pathway
+## Phenylalanine Metabolism 8
+## Tyrosine Metabolism 24
+## Tryptophan Metabolism 26
+## Short Chain Fatty Acid 2
+## Polyamine Metabolism 7
+## Secondary Bile Acid Metabolism 29
+## Carnitine Metabolism 2
+## Histidine Metabolism 18
+
+
+## chemical name
+## betaine X799
+## choline X1256
+
+microb_sub_pathway_list <- c("Phenylalanine Metabolism", "Tyrosine Metabolism", "Tryptophan Metabolism", "Short Chain Fatty Acid", "Polyamine Metabolism", "Secondary Bile Acid Metabolism", "Carnitine Metabolism", "Histidine Metabolism")
+
+microb_mets_list <- mets_info_updated[SUB_PATHWAY %in% microb_sub_pathway_list,]$Name
+microb_mets_list <- c(microb_mets_list, "X799", "X1256")
+length(microb_mets_list)
+
+microb_mets_info <- mets_info_updated[SUB_PATHWAY %in% microb_sub_pathway_list,]
+setcolorder(microb_mets_info, c("SUPER_PATHWAY", "SUB_PATHWAY", "CHEMICAL_NAME"))
+
+```
+
+## 2.5 sph/str
+```{r}
+df <- mets_df_unique %>% as.data.frame()
+df <- df[,-c(1)]
+rownames(df) <- df$Biobank_Subject_ID
+df <- df[,-1]
+
+df_ratios <- df
+
+for (i in 1:length(sph_mets_list)) {
+  for (j in 1:length(str_mets_list)) {
+    sph <- sph_mets_list[i]
+    steroid <- str_mets_list[j]
+    eval(parse(text = str_c("df_ratios$", sph, ".", steroid ," <- df_ratios$", sph, "/", "df_ratios$", steroid)))
+  }
+}
+
+df_ratios <- df_ratios[,-which(colnames(df_ratios) %in% colnames(df))]
+ncol(df_ratios)
+
+df_sph_steroid_ratio <- df_ratios
+df_sph_steroid_ratio$Biobank_Subject_ID <- rownames(df_sph_steroid_ratio)
+df_sph_steroid_ratio %>% setcolorder(., "Biobank_Subject_ID")
+df_sph_steroid_ratio <- as.data.table(df_sph_steroid_ratio)
+df_sph_steroid_ratio_new <- df_sph_steroid_ratio[Biobank_Subject_ID %in% pool_df_new$Biobank_Subject_ID,]
+# df_sph_steroid_ratio_log <- df_sph_steroid_ratio
+# df_sph_steroid_ratio_log[,c(2:2853)] <- log10(df_sph_steroid_ratio_log[,c(2:2853)])
+
+# df_sph_steroid_ratio_log <- df_sph_steroid_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+# missing
+mets_missing_sph_str <- df_sph_steroid_ratio_new[, lapply(.SD, function(x) mean(is.na(x))), .SDcols = colnames(df_sph_steroid_ratio_new)[2:ncol(df_sph_steroid_ratio_new)]] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_missing_sph_str, c("Name", "pct_na_met"))
+summary(mets_missing_sph_str$pct_na_met)
+
+# histogram
+ggplot(df_sph_steroid_ratio_new, aes(x=X100000626.X100000792)) + geom_histogram()
+ggplot(df_sph_steroid_ratio_new, aes(x=X100000626.X100001987)) + geom_histogram()
+
+
+# log transformed
+df_sph_steroid_ratio_log <- df_sph_steroid_ratio_new
+df_sph_steroid_ratio_log[,c(2:2853)] <- log2(df_sph_steroid_ratio_log[,c(2:2853)])
+
+df_sph_steroid_ratio_log <- df_sph_steroid_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+ggplot(df_sph_steroid_ratio_log, aes(x=X100000626.X100000792)) + geom_histogram()
+ggplot(df_sph_steroid_ratio_log, aes(x=X100000626.X100001987)) + geom_histogram()
+
+```
+
+## 2.6 sph/microb
+```{r}
+df <- mets_df_unique %>% as.data.frame()
+df <- df[,-c(1)]
+rownames(df) <- df$Biobank_Subject_ID
+df <- df[,-1]
+
+df_ratios <- df
+
+for (i in 1:length(sph_mets_list)) {
+  for (j in 1:length(microb_mets_list)) {
+    sph <- sph_mets_list[i]
+    microb <- microb_mets_list[j]
+    eval(parse(text = str_c("df_ratios$", sph, ".", microb ," <- df_ratios$", sph, "/", "df_ratios$", microb)))
+  }
+}
+
+df_ratios <- df_ratios[,-which(colnames(df_ratios) %in% colnames(df))]
+ncol(df_ratios)
+
+df_sph_microb_ratio <- df_ratios
+df_sph_microb_ratio$Biobank_Subject_ID <- rownames(df_sph_microb_ratio)
+df_sph_microb_ratio %>% setcolorder(., "Biobank_Subject_ID")
+df_sph_microb_ratio <- as.data.table(df_sph_microb_ratio)
+df_sph_microb_ratio_new <- df_sph_microb_ratio[Biobank_Subject_ID %in% pool_df_new$Biobank_Subject_ID,]
+# df_sph_microb_ratio_log <- df_sph_microb_ratio
+# df_sph_microb_ratio_log[,c(2:2853)] <- log10(df_sph_microb_ratio_log[,c(2:2853)])
+
+# df_sph_microb_ratio_log <- df_sph_microb_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+# missing
+mets_missing_sph_microb <- df_sph_microb_ratio_new[, lapply(.SD, function(x) mean(is.na(x))), .SDcols = colnames(df_sph_microb_ratio_new)[2:ncol(df_sph_microb_ratio_new)]] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_missing_sph_str, c("Name", "pct_na_met"))
+summary(mets_missing_sph_str$pct_na_met)
+
+# histogram
+ggplot(df_sph_microb_ratio_new, aes(x=X100000626.X100000007)) + geom_histogram()
+ggplot(df_sph_microb_ratio_new, aes(x=X100000626.X100000463)) + geom_histogram()
+
+
+# log transformed
+df_sph_microb_ratio_log <- df_sph_microb_ratio_new
+df_sph_microb_ratio_log[,c(2:2853)] <- log2(df_sph_microb_ratio_log[,c(2:2853)])
+
+df_sph_microb_ratio_log <- df_sph_microb_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+ggplot(df_sph_microb_ratio_log, aes(x=X100000626.X100000007)) + geom_histogram()
+ggplot(df_sph_microb_ratio_log, aes(x=X100000626.X100000463)) + geom_histogram()
+
+
+```
+
+
+## 2.7 microb/str
+```{r}
+df <- mets_df_unique %>% as.data.frame()
+df <- df[,-c(1)]
+rownames(df) <- df$Biobank_Subject_ID
+df <- df[,-1]
+
+df_ratios <- df
+
+for (i in 1:length(microb_mets_list)) {
+  for (j in 1:length(str_mets_list)) {
+    microb <- microb_mets_list[i]
+    str <- str_mets_list[j]
+    eval(parse(text = str_c("df_ratios$", microb, ".", str ," <- df_ratios$", microb, "/", "df_ratios$", str)))
+  }
+}
+
+df_ratios <- df_ratios[,-which(colnames(df_ratios) %in% colnames(df))]
+ncol(df_ratios)
+
+df_microb_str_ratio <- df_ratios
+df_microb_str_ratio$Biobank_Subject_ID <- rownames(df_microb_str_ratio)
+df_microb_str_ratio %>% setcolorder(., "Biobank_Subject_ID")
+df_microb_str_ratio <- as.data.table(df_microb_str_ratio)
+df_microb_str_ratio_new <- df_microb_str_ratio[Biobank_Subject_ID %in% pool_df_new$Biobank_Subject_ID,]
+# df_microb_str_ratio_log <- df_microb_str_ratio
+# df_microb_str_ratio_log[,c(2:2853)] <- log10(df_microb_str_ratio_log[,c(2:2853)])
+
+# df_microb_str_ratio_log <- df_microb_str_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+# missing
+mets_missing_microb_str <- df_microb_str_ratio_new[, lapply(.SD, function(x) mean(is.na(x))), .SDcols = colnames(df_microb_str_ratio_new)[2:ncol(df_microb_str_ratio_new)]] %>% 
+        t() %>% as.data.frame() %>% rownames_to_column()
+setnames(mets_missing_sph_str, c("Name", "pct_na_met"))
+summary(mets_missing_sph_str$pct_na_met)
+
+# histogram
+ggplot(df_microb_str_ratio_new, aes(x=X100000007.X100000792)) + geom_histogram()
+ggplot(df_microb_str_ratio_new, aes(x=X100000007.X100002014)) + geom_histogram()
+
+
+# log transformed
+df_microb_str_ratio_log <- df_microb_str_ratio_new
+df_microb_str_ratio_log[,c(2:2853)] <- log2(df_microb_str_ratio_log[,c(2:2853)])
+
+df_microb_str_ratio_log <- df_microb_str_ratio_log %>% mutate_if(is.numeric, ~ replace(., !is.finite(.), NA))
+
+ggplot(df_microb_str_ratio_log, aes(x=X100000007.X100000792)) + geom_histogram()
+ggplot(df_microb_str_ratio_log, aes(x=X100000007.X100002014)) + geom_histogram()
+
+```
+
+# 3. Regression model function
+## 3.1 logistic regression
+```{r}
+## test
+# fit <- glm(Asthma_Status ~ F100_hilic_pos + bmi, data = pheno_mets, family = 'binomial')
+# summary(fit)
+# fit <- glm(asthma_num ~ F100_hilic_pos + bmi, data = pheno_mets, family = 'binomial')
+# summary(fit)
+# 
+# coef <- summary(fit)$coefficients %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+# coef <- coef[rowname  == "F100_hilic_pos", ]
+# 
+# output <- cbind("Asthma_Status", coef)
+# colnames(output) <- c("outc", "feat_id", "beta", "zval", "pval")
+# output[, (colnames(output)[-c(1:2)]) := lapply(.SD, as.numeric), .SDcols = colnames(output)[-c(1:2)]]
+          
+
+logi_res_fnc <- function(outc, mets_list, dat, add_covar = "",
+                         first_cols = c("Name", 
+                                        "outc", "beta", "pval", "fdr", "or", "lower95", "upper95")) {
+        
+        logi_mdl_tmp <- function(met) {
+                
+                fit <- eval(parse(text = str_c("glm(", outc, " ~ ", met, add_covar, ", data = ", dat, ", family = 'binomial')")))
+                
+                coef <- summary(fit)$coefficients %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+                coef <- coef[rowname == met, ]
+
+                output <- cbind(outc, coef)
+                colnames(output) <- c("outc", "Name", "beta", "se", "zval", "pval")
+                output[, (colnames(output)[-c(1:2)]) := lapply(.SD, as.numeric), .SDcols = colnames(output)[-c(1:2)]]
+                
+                return(output)
+        }
+        
+        res <- lapply(mets_list, function(x) {logi_mdl_tmp(met = x)}) %>% rbindlist()
+        
+        # eval(parse(text = str_c("mets_info <- copy(", mets_info, ")")))
+        # res <- merge(res, mets_info, by = "feat_id", all.x = T)
+        res[, ':='(neg_log10_pval = -log10(pval), 
+                   fdr = p.adjust(pval, method = "fdr"), 
+                   or = exp(beta), 
+                   lower95 = exp(beta-z_95*se), 
+                   upper95 = exp(beta+z_95*se))]
+        res[, totaln := eval(parse(text = str_c(dat, "[!is.na(", outc, "), .N]")))]
+        
+        setcolorder(res, first_cols)
+        res <- res[order(pval)]
+        return(res)
+}
+
+```
+
+## 3.2 linear regression
+```{r}
+linreg_res_fnc <- function(outc, mets_list, dat, add_covar = "", 
+                           first_cols = c("Name", "outc", "beta", "pval", "fdr", "fdr_bh"), 
+                           na_thld = missing_thld) {
+        
+        linear_mdl_tmp <- function(met) {
+                
+                fit <- eval(parse(text = str_c("lm(", outc, " ~ ", met, 
+                                               add_covar, ", data = ", dat, ")")))
+                
+                coef <- summary(fit)$coefficients %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+                coef <- coef[rowname == met, ]
+
+                output <- cbind(outc, coef)
+                colnames(output) <- c("outc", "Name", "beta", "se", "tval", "pval")
+                output[, (colnames(output)[-c(1:2)]) := lapply(.SD, as.numeric), .SDcols = colnames(output)[-c(1:2)]]
+                
+                return(output)
+        }
+        
+        res <- lapply(mets_list, function(x) {linear_mdl_tmp(met = x)}) %>% rbindlist()
+        
+        # eval(parse(text = str_c("mets_info <- copy(", mets_info, ")")))
+        # res <- merge(res, mets_info, by = "feat_id")
+        res[, ':='(fdr = p.adjust(pval, method = "fdr"), 
+                   fdr_bh = p.adjust(pval, method = "BH"))]
+        res[, totaln := eval(parse(text = str_c(dat, "[!is.na(", outc, "), .N]")))]
+
+        setcolorder(res, first_cols)
+        res <- res[order(pval)]
+        return(res)
+}
+
+```
+
+## 3.3 poisson regression
+```{r}
+# test
+# fit <- glm(ocs_trim_totnum_5y ~ Cer20_1d18_1 + Age_at_Collection + bmi + Gender + race + Ethnicity + ics_trim_totnum_5y, family="poisson", data = pheno_tmp)
+# summary(fit)
+# coef <- summary(fit)$coefficients %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+
+poiss_res_fnc <- function(outc, mets_list, dat, add_covar = "",
+                         first_cols = c("Name", 
+                                        "outc", "beta", "pval", "fdr")) {
+        
+        logi_mdl_tmp <- function(met) {
+                
+                fit <- eval(parse(text = str_c("glm(", outc, " ~ ", met, add_covar, ", data = ", dat, ", family = 'quasipoisson')")))
+                
+                coef <- summary(fit)$coefficients %>% as.data.frame() %>% rownames_to_column() %>% as.data.table()
+                coef <- coef[rowname == met, ]
+
+                output <- cbind(outc, coef)
+                colnames(output) <- c("outc", "Name", "beta", "se", "zval", "pval")
+                output[, (colnames(output)[-c(1:2)]) := lapply(.SD, as.numeric), .SDcols = colnames(output)[-c(1:2)]]
+                
+                return(output)
+        }
+        
+        res <- lapply(mets_list, function(x) {logi_mdl_tmp(met = x)}) %>% rbindlist()
+        
+        # eval(parse(text = str_c("mets_info <- copy(", mets_info, ")")))
+        # res <- merge(res, mets_info, by = "feat_id", all.x = T)
+        res[, ':='(neg_log10_pval = -log10(pval), 
+                   fdr = p.adjust(pval, method = "fdr"))]
+        res[, totaln := eval(parse(text = str_c(dat, "[!is.na(", outc, "), .N]")))]
+        
+        setcolorder(res, first_cols)
+        res <- res[order(pval)]
+        return(res)
+}
+
+```
+
+
+# 4 Subgroup analysis -- ODOLLFA&PHASIC
+```{r}
+save_manh_plot <- function(dat, title_infig, fig_name, wdth = 20, ht = 12, pointsize = 3, pointstroke = 1.5,
+                           transparency = 1, if_lbl = c(T, F), lbl_thld = 2e-04) {
+  
+        p <- ggplot(dat, aes(x = Name, y = -log10(pval))) + 
+                    facet_grid(. ~ denominator_sub_pathway, scales = "free_x") +  
+                    geom_point(aes(color = numerator_sub_pathway , shape = direction_of_effect), 
+                               size = pointsize, stroke = pointstroke, alpha = transparency) + 
+                    scale_shape_manual(values = c("-" = 6, "+" = 2)) + 
+                    labs(title = title_infig, 
+                         y = expression('-log'[10]*'('*italic(P)*'-value)')) + 
+                    theme(legend.position = "bottom", 
+                          legend.text = element_text(size = 16), 
+                          plot.title = element_text(hjust = 0.5, size = 20), 
+                          strip.text.x = element_text(size = 16), 
+                          axis.title.x = element_blank(),
+                          axis.text.x = element_blank(), 
+                          axis.ticks.x = element_blank(), 
+                          axis.title.y = element_text(size = 16), 
+                          axis.text.y = element_text(size = 16),
+                          panel.border = element_blank(),
+                          panel.grid.major = element_blank(),
+                          panel.grid.minor = element_blank())
+        if (if_lbl == T) {
+                p <- p + geom_label_repel(aes(label = ifelse(pval < lbl_thld, CHEMICAL_NAME, "")),
+                                          box.padding   = 0.25,
+                                          point.padding = 0.5,
+                                          segment.color = 'grey50',
+                                          max.overlaps = 80)
+        }
+        ggsave(file = here::here(fig_dir, fig_name), plot = p, width = wdth, height = ht)
+}
+
+
+
+```
+
+## 4.1 OCS use count within 5 years after collection date (adjust ICS use)
+```{r}
+table(pool_df_new$asthma_existence)
+dat_tmp <- pool_df_new
+
+sum(is.na(dat_tmp$ocs_trim_totnum_5y_after))
+dat_tmp <- dat_tmp[!is.na(dat_tmp$ocs_trim_totnum_5y_after),]
+ggplot(dat_tmp, aes(x=ocs_trim_totnum_5y_after))+ geom_histogram(color="darkblue", fill="lightblue")
+
+# tertile
+vTert = quantile(dat_tmp$ocs_trim_totnum_5y_after, c(0:3/3), na.rm = T)
+dat_tmp$ocs_5y_cat_t_after = with(dat_tmp, 
+                             cut(ocs_trim_totnum_5y_after, 
+                                 vTert, 
+                                 include.lowest = T, 
+                                 labels = c("Low", "Medium", "High")))
+
+dat_tmp[, .N, .(ocs_5y_cat_t_after)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$ocs_5y_asthma_t_after <- with(dat_tmp, ifelse(ocs_5y_cat_t_after == "Low", 0, 
+                                                 ifelse(ocs_5y_cat_t_after == "High", 1, NA)))
+
+dat_tmp[, .N, .(ocs_5y_asthma_t_after)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+summary(dat_tmp[ocs_5y_cat_t_after == "Low",]$ocs_trim_totnum_5y_after) #0-1
+summary(dat_tmp[ocs_5y_cat_t_after == "Medium",]$ocs_trim_totnum_5y_after) #2-7
+summary(dat_tmp[ocs_5y_cat_t_after == "High",]$ocs_trim_totnum_5y_after) #>=8
+
+dat_tmp$ocs_5y_asthma_t_after <- as.character(dat_tmp$ocs_5y_asthma_t_after)
+dat_tmp[, .N, .(ocs_5y_asthma_t_after)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# mean as cutoff
+## No ocs= ocs_totnum of 0  
+## Maybe > 0 but <= mean
+## Yes ocs => mean
+# after 5y
+mean(dat_tmp$ocs_trim_totnum_5y_after, na.rm = T) #8.981774
+dat_tmp$ocs_5y_cat_after <- with(dat_tmp, ifelse(dat_tmp$ocs_trim_totnum_5y_after == 0, "noocs", 
+                                          ifelse(dat_tmp$ocs_trim_totnum_5y_after > 0 & dat_tmp$ocs_trim_totnum_5y_after <= 8.981774, "maybe", 
+                                          ifelse(dat_tmp$ocs_trim_totnum_5y_after > 8.981774, "ocs", "<NA>"))))
+dat_tmp[, .N, .(ocs_5y_cat_after)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$ocs_5y_3cat_after <- with(dat_tmp, ifelse(ocs_5y_cat_after == "ocs", 1,
+                                           ifelse(ocs_5y_cat_after == "noocs", 0, NA)))
+dat_tmp[, .N, .(ocs_5y_3cat_after)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# mean as cutoff based on PEGASUS
+## No ocs= ocs_totnum of 0  
+## Maybe > 0 but <= mean
+## Yes ocs => mean
+# after 5y
+dat_tmp$ocs_5y_cat_after_p <- with(dat_tmp, ifelse(dat_tmp$ocs_trim_totnum_5y_after == 0, "noocs", 
+                                            ifelse(dat_tmp$ocs_trim_totnum_5y_after > 0 & dat_tmp$ocs_trim_totnum_5y_after <= 7.166387, "maybe", 
+                                            ifelse(dat_tmp$ocs_trim_totnum_5y_after > 7.166387, "ocs", "<NA>"))))
+dat_tmp[, .N, .(ocs_5y_cat_after_p)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$ocs_5y_3cat_after_p <- with(dat_tmp, ifelse(ocs_5y_cat_after_p == "ocs", 1,
+                                             ifelse(ocs_5y_cat_after_p == "noocs", 0, NA)))
+dat_tmp[, .N, .(ocs_5y_3cat_after_p)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+### the clinical difference between ocs use and non-ocs use (prospective)
+
+dat_tmp$ocs_5y_3cat_after_p_f <- factor(dat_tmp$ocs_5y_3cat_after_p, levels = c("0", "1"))
+dat_tmp[, .N, .(ocs_5y_3cat_after_p_f)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$log_ige <- log(dat_tmp$ige_closest_lastpl)
+dat_tmp$log_ige[is.infinite(dat_tmp$log_ige)] <- NA
+
+dat_tmp$Ethnicity_2 <- with(dat_tmp, ifelse(Ethnicity == "HISPANIC", "Hispanic", "Non Hispanic"))
+
+table1(~ Age_at_collect + BMI_most_recent + Gender + race + Ethnicity_2 + ics_trim_totnum_5y + ocs_trim_totnum_5y + EOScount_median_24M + NEUcount_median_24M + BASOpct_median_24M + log_ige +
+         FEV1_most_recent + FVC_most_recent + `FEV1/FVC_most_recent`| ocs_5y_3cat_after_p_f, data = dat_tmp, overall = T,
+         extra.col=list(`P-value`=pvalue))
+
+
+# mean as cutoff
+## No ocs= ocs_totnum of 0  
+## Maybe > 0 but <= mean
+## Yes ocs => mean
+# within 5y
+mean(dat_tmp$ocs_trim_totnum_5y, na.rm = T) # 8.556501
+dat_tmp$ocs_5y_cat <- with(dat_tmp, ifelse(dat_tmp$ocs_trim_totnum_5y == 0, "noocs", 
+                                    ifelse(dat_tmp$ocs_trim_totnum_5y > 0 & dat_tmp$ocs_trim_totnum_5y_after <= 8.556501, "maybe", 
+                                    ifelse(dat_tmp$ocs_trim_totnum_5y > 8.556501, "ocs", "<NA>"))))
+dat_tmp[, .N, .(ocs_5y_cat)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$ocs_5y_3cat <- with(dat_tmp, ifelse(ocs_5y_cat == "ocs", 1,
+                                     ifelse(ocs_5y_cat == "noocs", 0, NA)))
+dat_tmp[, .N, .(ocs_5y_3cat)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+# mean as cutoff based on PEGASUS
+## No ocs= ocs_totnum of 0  
+## Maybe > 0 but <= mean
+## Yes ocs => mean
+# within 5y
+dat_tmp$ocs_5y_cat_p <- with(dat_tmp, ifelse(dat_tmp$ocs_trim_totnum_5y == 0, "noocs", 
+                                      ifelse(dat_tmp$ocs_trim_totnum_5y > 0 & dat_tmp$ocs_trim_totnum_5y_after <= 6.37963, "maybe", 
+                                    ifelse(dat_tmp$ocs_trim_totnum_5y > 6.37963, "ocs", "<NA>"))))
+dat_tmp[, .N, .(ocs_5y_cat_p)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+dat_tmp$ocs_5y_3cat_p <- with(dat_tmp, ifelse(ocs_5y_cat_p == "ocs", 1,
+                                       ifelse(ocs_5y_cat_p == "noocs", 0, NA)))
+dat_tmp[, .N, .(ocs_5y_3cat_p)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+```
+
+### 4.1.1 sph/microb
+```{r}
+list_analysis <- colnames(df_sph_microb_ratio[,-1])
+length(list_analysis) #7316
+
+# list_tmp <- append("Biobank_Subject_ID", list_analysis)
+df_sph_microb_ratio_log$Biobank_Subject_ID <- as.integer(df_sph_microb_ratio_log$Biobank_Subject_ID)
+pheno_tmp <- merge(dat_tmp, df_sph_microb_ratio_log, by = "Biobank_Subject_ID", all.y = T)
+
+res_4.1.1 <- poiss_res_fnc(outc = "ocs_trim_totnum_5y_after", 
+                           mets_list = list_analysis, 
+                           dat = "pheno_tmp", 
+                           add_covar = " + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y")
+
+## Save results
+res_ocs_use_after_sph_microb_ratio <- res_4.1.1
+res_ocs_use_after_sph_microb_ratio <- res_ocs_use_after_sph_microb_ratio %>% separate(Name, sep = "\\.", c("numerator", "denominator"), remove = F)
+
+dict <- mets_info_updated[,c("Name", "CHEMICAL_NAME", "SUB_PATHWAY", "SUPER_PATHWAY")]
+res_ocs_use_after_sph_microb_ratio$numerator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_sph_microb_ratio$numerator, dict$Name)]
+res_ocs_use_after_sph_microb_ratio$numerator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_sph_microb_ratio$numerator, dict$CHEMICAL_NAME)]
+
+res_ocs_use_after_sph_microb_ratio$denominator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_sph_microb_ratio$denominator, dict$Name)]
+res_ocs_use_after_sph_microb_ratio$denominator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_sph_microb_ratio$denominator, dict$CHEMICAL_NAME)]
+
+setcolorder(res_ocs_use_after_sph_microb_ratio, c("Name", "numerator", "numerator_sub_pathway", "denominator", "denominator_sub_pathway"))
+
+
+## manhattan plot
+# res_ocs_use_after_sph_microb_ratio$direction_of_effect <- with(res_ocs_use_after_sph_microb_ratio, ifelse(beta < 0, "-", "+"))
+# res_ocs_use_after_sph_microb_ratio$CHEMICAL_NAME <- paste(res_ocs_use_after_sph_microb_ratio$numerator, res_ocs_use_after_sph_microb_ratio$denominator, sep = "/")
+# 
+# res_ocs_use_after_sph_microb_ratio <- res_ocs_use_after_sph_microb_ratio[order(denominator_sub_pathway, numerator_sub_pathway, Name)]
+# res_ocs_use_after_sph_microb_ratio$numerator_sub_pathway <- factor(res_ocs_use_after_sph_microb_ratio$numerator_sub_pathway, 
+#                                               levels = as.vector(unique(res_ocs_use_after_sph_microb_ratio$numerator_sub_pathway)))
+# res_ocs_use_after_sph_microb_ratio$Name <- factor(res_ocs_use_after_sph_microb_ratio$Name, levels = as.vector(res_ocs_use_after_sph_microb_ratio$Name))
+# 
+# save_manh_plot(dat = res_ocs_use_after_sph_microb_ratio, 
+#                title_infig = "sphingolipid/microb metabolite ratio association results (ocs_use_after asthma vs non ocs_use_after asthma)", 
+#                fig_name = "/res_ocs_use_after_sph_microb_ratio.png", 
+#                if_lbl = T, lbl_thld = 5e-4, wdth = 36)
+
+# res_ocs_use_after_sph_microb_ratio_fdr_sig <- res_ocs_use_after_sph_microb_ratio[fdr <= 0.05]
+# res_ocs_use_after_sph_microb_ratio_fdr_sig <- res_ocs_use_after_sph_microb_ratio[pval <= 0.05]
+
+## display results
+datatable(res_ocs_use_after_sph_microb_ratio[fdr <= 0.05], 
+          filter = "top") %>% 
+          formatSignif(columns = c("beta", "pval", "fdr","se", "zval", "neg_log10_pval"), digits = 3)
+```
+
+### 4.1.2 sph/str
+```{r}
+list_analysis <- colnames(df_sph_steroid_ratio[,-1])
+length(list_analysis) #2852
+
+# list_tmp <- append("Biobank_Subject_ID", list_analysis)
+df_sph_steroid_ratio_log$Biobank_Subject_ID <- as.integer(df_sph_steroid_ratio_log$Biobank_Subject_ID)
+pheno_tmp <- merge(dat_tmp, df_sph_steroid_ratio_log, by = "Biobank_Subject_ID", all.y = T)
+
+res_4.1.2 <- poiss_res_fnc(outc = "ocs_trim_totnum_5y_after", 
+                           mets_list = list_analysis, 
+                           dat = "pheno_tmp", 
+                           add_covar = " + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y")
+
+## Save results
+res_ocs_use_after_sph_str_ratio <- res_4.1.2
+res_ocs_use_after_sph_str_ratio <- res_ocs_use_after_sph_str_ratio %>% separate(Name, sep = "\\.", c("numerator", "denominator"), remove = F)
+
+dict <- mets_info_updated[,c("Name", "CHEMICAL_NAME", "SUB_PATHWAY", "SUPER_PATHWAY")]
+res_ocs_use_after_sph_str_ratio$numerator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_sph_str_ratio$numerator, dict$Name)]
+res_ocs_use_after_sph_str_ratio$numerator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_sph_str_ratio$numerator, dict$CHEMICAL_NAME)]
+
+res_ocs_use_after_sph_str_ratio$denominator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_sph_str_ratio$denominator, dict$Name)]
+res_ocs_use_after_sph_str_ratio$denominator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_sph_str_ratio$denominator, dict$CHEMICAL_NAME)]
+
+setcolorder(res_ocs_use_after_sph_str_ratio, c("Name", "numerator", "numerator_sub_pathway", "denominator", "denominator_sub_pathway"))
+
+
+## manhattan plot
+# res_ocs_use_after_sph_str_ratio$direction_of_effect <- with(res_ocs_use_after_sph_str_ratio, ifelse(beta < 0, "-", "+"))
+# res_ocs_use_after_sph_str_ratio$CHEMICAL_NAME <- paste(res_ocs_use_after_sph_str_ratio$numerator, res_ocs_use_after_sph_str_ratio$denominator, sep = "/")
+# 
+# res_ocs_use_after_sph_str_ratio <- res_ocs_use_after_sph_str_ratio[order(denominator_sub_pathway, numerator_sub_pathway, Name)]
+# res_ocs_use_after_sph_str_ratio$numerator_sub_pathway <- factor(res_ocs_use_after_sph_str_ratio$numerator_sub_pathway, 
+#                                               levels = as.vector(unique(res_ocs_use_after_sph_str_ratio$numerator_sub_pathway)))
+# res_ocs_use_after_sph_str_ratio$Name <- factor(res_ocs_use_after_sph_str_ratio$Name, levels = as.vector(res_ocs_use_after_sph_str_ratio$Name))
+# 
+# save_manh_plot(dat = res_ocs_use_after_sph_str_ratio, 
+#                title_infig = "sphingolipid/steroid metabolite ratio association results (ocs_use_after asthma vs non ocs_use_after asthma)", 
+#                fig_name = "/res_ocs_use_after_sph_str_ratio.png", 
+#                if_lbl = T, lbl_thld = 5e-4, wdth = 36)
+
+# res_ocs_use_after_sph_str_ratio_fdr_sig <- res_ocs_use_after_sph_str_ratio[fdr <= 0.05]
+# res_ocs_use_after_sph_str_ratio_fdr_sig <- res_ocs_use_after_sph_str_ratio[pval <= 0.05]
+
+## display results
+datatable(res_ocs_use_after_sph_str_ratio[fdr <= 0.05], 
+          filter = "top") %>% 
+          formatSignif(columns = c("beta", "pval", "fdr","se", "zval", "neg_log10_pval"), digits = 3)
+```
+
+#### validation based on PEGASUS Elastic Net
+```{r}
+# predict previous
+# based on Elastic net, we identified 21 ratio + race + ics use within the last 5 years can determine the previous ocs use in 5 years
+# ics_trim_totnum_5y
+# race
+# 1. Cer20_1d18_1.S10_steroid = Cer20_1d18_1/DHEAS ~ X100015735/X100000792 - OK
+# 2. Cer20_0d18_1.S10_steroid = Cer20_0d18_1/DHEAS ~ X100015755/X100000792 - OK
+# 3. Cer26_1d18_1.S10_steroid = Cer26_1d18_1/DHEAS ~ X100015744/X100000792 - maybe OK
+# 4. SM20_d18_1.S10_steroid = SM20_d18_1/DHEAS ~ X100006290/X100000792 - OK
+# 5. Sph18_1.S10_steroid = Sph18_1/DHEAS ~ X297/X100000792 -- OK
+# 6. Spad18_0.S10_steroid = Spad18_0/DHEAS ~ X313/X100000792 -- OK
+# 7. Cer20_1d18_1.S8_steroid = Cer20_1d18_1/cortisone ~ X100015735/X273 - OK
+# 8. Cer26_1d18_1.S8_steroid = Cer26_1d18_1/cortisone ~ X100015744/X273 - maybe OK
+# 9. HexCer24_1.S8_steroid = HexCer24_1/cortisone ~ X100015752/X273 - OK
+# 10. SM20_d18_1.S8_steroid = SM20_d18_1/cortisone ~ X100006290/X273 - OK
+# 11. Spad18_0.S8_steroid = Spad18_0/cortisone ~ X313/X273 - OK
+# 12. Cer20_1d18_1.S6_steroid = Cer20_1d18_1/corticosterone ~ X100015735/X272 - OK
+# 13. Cer26_1d18_1.S6_steroid = Cer26_1d18_1/corticosterone ~ X100015744/X272 - maybe OK
+# 14. HexCer24_1.S6_steroid = HexCer24_1/corticosterone ~ X100015752/X272 - OK
+# 15. SM20_d18_1.S6_steroid = SM20_d18_1/corticosterone ~ X100006290/X272 - OK
+# 16, Spad18_0.S6_steroid = Spad18_0/corticosterone ~ X313/X272 - OK
+
+
+selected_x_y <- c("ics_trim_totnum_5y", "race",
+                  "X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                  "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                  "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                  "X100006290.X273", "X313.X273", "X100015735.X272",
+                  "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272",
+                  "ocs_5y_3cat_after_p")
+selected_ratio <- c("X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                    "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                    "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                    "X100006290.X273", "X313.X273", "X100015735.X272",
+                    "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272")
+tmp <- pheno_tmp[,..selected_x_y]
+
+# Standardize data
+tmp[, (selected_ratio) := lapply(.SD, function(x) scale(x, center = T, scale = T)), .SDcols = selected_ratio]
+fit <- glm(ocs_5y_3cat_after_p ~ ., data = tmp, family = "binomial")
+summary(fit)$coefficients
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs)
+auc(roc_obj) #0.7205
+
+plot(roc_obj, main="ROC Curve")
+
+
+# predict with the last five years
+selected_x_y <- c("ics_trim_totnum_5y", "race",
+                  "X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                  "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                  "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                  "X100006290.X273", "X313.X273", "X100015735.X272",
+                  "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272",
+                  "ocs_5y_3cat_p")
+selected_ratio <- c("X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                    "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                    "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                    "X100006290.X273", "X313.X273", "X100015735.X272",
+                    "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272")
+tmp <- pheno_tmp[,..selected_x_y]
+# Standardize data
+tmp[, (selected_ratio) := lapply(.SD, function(x) scale(x, center = T, scale = T)), .SDcols = selected_ratio]
+fit <- glm(ocs_5y_3cat_p ~ ., data = tmp, family = "binomial")
+summary(fit)$coefficients
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(pheno_tmp$ocs_5y_3cat_p, probs)
+auc(roc_obj) #0.7846
+
+plot(roc_obj, main="ROC Curve")
+```
+
+#### plot ROC final
+```{r}
+## prospective ocs use: ics use + race, logistic -- AUC=0.5285
+selected_x_y <- c("race", "ics_trim_totnum_5y",
+                  "ocs_5y_3cat_after_p")
+tmp <- pheno_tmp[,..selected_x_y]
+fit <- glm(ocs_5y_3cat_after_p ~ ., data = tmp, family = "binomial")
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs)
+auc(roc_obj) #0.5285
+roc1 <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs, smooth=T, smooth.n=200)
+
+roc1_df <- data.frame(
+  sensitivity = roc1$sensitivities,
+  specificity = 1 - roc1$specificities,  # ggplot requires 1 - specificity
+  model = 'incident exacerbation ~ Race + ICS'
+)
+
+## prospective ocs use: ics use + race + IgE, logistic -- AUC=0.6232
+selected_x_y <- c("race", "ics_trim_totnum_5y", "ige_closest_lastpl",
+                  "ocs_5y_3cat_after_p")
+tmp <- pheno_tmp[,..selected_x_y]
+fit <- glm(ocs_5y_3cat_after_p ~ ., data = tmp, family = "binomial")
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs)
+auc(roc_obj) #0.6232
+roc2 <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs, smooth=T, smooth.n=200)
+
+roc2_df <- data.frame(
+  sensitivity = roc2$sensitivities,
+  specificity = 1 - roc2$specificities,  # ggplot requires 1 - specificity
+  model = 'incident exacerbation ~ Race + ICS + IgE'
+)
+
+
+## prospective ocs use ~ race + ics use + 16 ratios, logistic -- AUC=0.7205
+selected_x_y <- c("ics_trim_totnum_5y", "race",
+                  "X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                  "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                  "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                  "X100006290.X273", "X313.X273", "X100015735.X272",
+                  "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272",
+                  "ocs_5y_3cat_after_p")
+selected_ratio <- c("X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                    "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                    "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                    "X100006290.X273", "X313.X273", "X100015735.X272",
+                    "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272")
+tmp <- pheno_tmp[,..selected_x_y]
+
+# Standardize data
+tmp[, (selected_ratio) := lapply(.SD, function(x) scale(x, center = T, scale = T)), .SDcols = selected_ratio]
+fit <- glm(ocs_5y_3cat_after_p ~ ., data = tmp, family = "binomial")
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(tmp$ocs_5y_3cat_after_p, probs)
+auc(roc_obj) #0.7205
+roc3 <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs, smooth=T, smooth.n=200)
+
+roc3_df <- data.frame(
+  sensitivity = roc3$sensitivities,
+  specificity = 1 - roc3$specificities,  # ggplot requires 1 - specificity
+  model = 'incident exacerbation ~ Race + ICS + 16 ratios'
+)
+
+
+## prospective ocs use ~ race + ics use + IgE + 16 ratios, logistic -- AUC=0.8926
+selected_x_y <- c("ics_trim_totnum_5y", "race", "ige_closest_lastpl",
+                  "X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                  "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                  "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                  "X100006290.X273", "X313.X273", "X100015735.X272",
+                  "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272",
+                  "ocs_5y_3cat_after_p")
+selected_ratio <- c("X100015735.X100000792", "X100015755.X100000792", "X100015744.X100000792", 
+                    "X100006290.X100000792", "X297.X100000792", "X313.X100000792",
+                    "X100015735.X273", "X100015744.X273", "X100015752.X273",
+                    "X100006290.X273", "X313.X273", "X100015735.X272",
+                    "X100015744.X272", "X100015752.X272", "X100006290.X272", "X313.X272")
+tmp <- pheno_tmp[,..selected_x_y]
+
+# Standardize data
+tmp[, (selected_ratio) := lapply(.SD, function(x) scale(x, center = T, scale = T)), .SDcols = selected_ratio]
+fit <- glm(ocs_5y_3cat_after_p ~ ., data = tmp, family = "binomial")
+
+probs <- predict(fit, newdata = tmp, type = "response")
+roc_obj <- roc(tmp$ocs_5y_3cat_after_p, probs)
+auc(roc_obj) #0.8926
+roc4 <- roc(pheno_tmp$ocs_5y_3cat_after_p, probs, smooth=T, smooth.n=200)
+
+roc4_df <- data.frame(
+  sensitivity = roc4$sensitivities,
+  specificity = 1 - roc4$specificities,  # ggplot requires 1 - specificity
+  model = 'incident exacerbation ~ Race + ICS + IgE + 16 ratios'
+)
+
+
+# Combine the data frames
+roc_df <- rbind(roc1_df, roc2_df, roc3_df, roc4_df)
+
+roc_df$model <- factor(roc_df$model, levels = c("incident exacerbation ~ Race + ICS",
+                                                "incident exacerbation ~ Race + ICS + IgE",
+                                                "incident exacerbation ~ Race + ICS + 16 ratios",
+                                                "incident exacerbation ~ Race + ICS + IgE + 16 ratios"
+                                                ))
+
+# Plot using ggplot2 with smoothing
+png(file=str_c(fig_dir, "ODOLLFA_roc_plot_final.png"), width = 6, height = 6, units = "in", res = 300)
+ggplot(roc_df, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_point(alpha = 0.2) +  # Optional: add points; make them slightly transparent
+  geom_line() +
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  theme_minimal() + coord_fixed(ratio = 1) +
+  theme(legend.position = "bottom",legend.box = "horizontal") +
+  guides(color = guide_legend(nrow = 4, byrow = TRUE)) + 
+  scale_color_manual(values = c("incident exacerbation ~ Race + ICS" = "#C77CFF",
+                                "incident exacerbation ~ Race + ICS + IgE" = "#7CAE00",
+                                "incident exacerbation ~ Race + ICS + 16 ratios" = "#00BFC4",
+                                "incident exacerbation ~ Race + ICS + IgE + 16 ratios" = "#F8766D"))  # Set the colors manually
+dev.off()
+
+# Combine the data frames
+roc_df <- rbind(roc1_df, roc2_df, roc5_df)
+
+roc_df$model <- factor(roc_df$model, levels = c("ics use + 2 ratios (previous)",
+                                                "ics use + 2 ratios (prospective)",
+                                                "previous ics use"))
+
+
+# Plot using ggplot2 with smoothing
+png(file=str_c(fig_dir, "ODOLLFA_roc_plot.png"), width = 6, height = 6, units = "in", res = 300)
+ggplot(roc_df, aes(x = specificity, y = sensitivity, color = model)) +
+  geom_point(alpha = 0.2) +  # Optional: add points; make them slightly transparent
+  geom_line() +
+  labs(x = "1 - Specificity", y = "Sensitivity") +
+  ggtitle("ODOLLFA\nSmoothed ROC curves for multiple models") +
+  theme_minimal() + coord_fixed(ratio = 1) +
+  theme(legend.position = "bottom",legend.box = "horizontal") +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) + 
+  scale_color_manual(values = c("ics use + 2 ratios (previous)" = "#4DAF4A", 
+                                "ics use + 2 ratios (prospective)" = "#377EB8",
+                                "previous ics use" = "#FF7F00"))  # Set the colors manually
+dev.off()
+
+
+```
+
+
+#### Cox - 1.X100015735/X100000792
+```{r}
+# 1. Cer20_1d18_1.S10_steroid = Cer20_1d18_1/DHEAS ~ X100015735/X100000792 - OK
+# X100015735.X100000792 = ceramide (d18:1/14:0, d16:1/16:0)*/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015735.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015735 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015735.X100000792, na.rm = T)
+vTert
+pheno_tmp$X100015735.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X100015735.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015735.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015735.X100000792_cat2 <- with(pheno_tmp, ifelse(X100015735.X100000792_quantile == "Q1", "Q1", ifelse(X100015735.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015735.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs1 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:1/14:0, d16:1/16:0) / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015735.X100000792_cat2), c("X100015735.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015735.X100000792_cat2), c("X100015735.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 2. X100015755/X100000792
+```{r}
+# 2. Cer20_0d18_1.S10_steroid = Cer20_0d18_1/DHEAS ~ X100015755/X100000792 - OK
+# X100015755.X100000792 = ceramide (d18:1/20:0, d16:1/22:0, d20:1/18:0)*/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015755.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015755 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015755.X100000792, na.rm = T)
+vTert
+pheno_tmp$X100015755.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X100015755.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015755.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015755.X100000792_cat2 <- with(pheno_tmp, ifelse(X100015755.X100000792_quantile == "Q1", "Q1", ifelse(X100015755.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015755.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015755.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs2 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:1/20:0, d16:1/22:0, d20:1/18:0) / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015755.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015755.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015755.X100000792_cat2), c("X100015755.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015755.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015755.X100000792_cat2), c("X100015755.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015755.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 3. X100015744/X100000792
+```{r}
+# 3. Cer26_1d18_1.S10_steroid = Cer26_1d18_1/DHEAS ~ X100015744/X100000792 - maybe OK
+# X100015744.X100000792 = ceramide (d18:2/24:1, d18:1/24:2)*/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015744.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015744 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015744.X100000792, na.rm = T)
+vTert
+pheno_tmp$X100015744.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X100015744.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015744.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015744.X100000792_cat2 <- with(pheno_tmp, ifelse(X100015744.X100000792_quantile == "Q1", "Q1", ifelse(X100015744.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015744.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs3 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:2/24:1, d18:1/24:2) / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015744.X100000792_cat2), c("X100015744.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015744.X100000792_cat2), c("X100015744.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 4. X100006290/X100000792
+```{r}
+# 4. SM20_d18_1.S10_steroid = SM20_d18_1/DHEAS ~ X100006290/X100000792 - OK
+# X100006290.X100000792 = sphingomyelin (d18:1/20:0, d16:1/22:0)*/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100006290.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100006290 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100006290.X100000792, na.rm = T)
+vTert
+pheno_tmp$X100006290.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X100006290.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100006290.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100006290.X100000792_cat2 <- with(pheno_tmp, ifelse(X100006290.X100000792_quantile == "Q1", "Q1", ifelse(X100006290.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100006290.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs4 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "SM(d18:1/20:0, d16:1/22:0) / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100006290.X100000792_cat2), c("X100006290.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100006290.X100000792_cat2), c("X100006290.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 5. X313/X100000792
+```{r}
+# 5. Spad18_0.S10_steroid = Spad18_0/DHEAS ~ X313/X100000792 -- OK
+# X313.X100000792 = sphinganine/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X313.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X313 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X313.X100000792, na.rm = T)
+vTert
+pheno_tmp$X313.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X313.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X313.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X313.X100000792_cat2 <- with(pheno_tmp, ifelse(X313.X100000792_quantile == "Q1", "Q1", ifelse(X313.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X313.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs5 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Sphinganine / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X313.X100000792_cat2), c("X313.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X313.X100000792_cat2), c("X313.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 6. X297/X100000792
+```{r}
+# 6. Sph18_1.S10_steroid = Sph18_1/DHEAS ~ X297/X100000792 -- OK
+# X297.X100000792 = sphingosine/DHEAS
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X297.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X297 + X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X297.X100000792, na.rm = T)
+vTert
+pheno_tmp$X297.X100000792_quantile = with(pheno_tmp, 
+                                                 cut(X297.X100000792, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X297.X100000792_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X297.X100000792_cat2 <- with(pheno_tmp, ifelse(X297.X100000792_quantile == "Q1", "Q1", ifelse(X297.X100000792_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X297.X100000792_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X297.X100000792_cat2, data = pheno_tmp)
+print(fit)
+
+gs6 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Sphingosine / DHEAS",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X297.X100000792_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X297.X100000792 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X297.X100000792_cat2), c("X297.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X297.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X297.X100000792_cat2), c("X297.X100000792_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X297.X100000792_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 7. X100015735/X273
+```{r}
+# 7. Cer20_1d18_1.S8_steroid = Cer20_1d18_1/cortisone ~ X100015735/X273 - OK
+# X100015735.X273 = ceramide (d18:1/14:0, d16:1/16:0)*/cortisone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015735.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015735 + X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015735.X273, na.rm = T)
+vTert
+pheno_tmp$X100015735.X273_quantile = with(pheno_tmp, 
+                                                 cut(X100015735.X273, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015735.X273_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015735.X273_cat2 <- with(pheno_tmp, ifelse(X100015735.X273_quantile == "Q1", "Q1", ifelse(X100015735.X273_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015735.X273_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X273_cat2, data = pheno_tmp)
+print(fit)
+
+gs7 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:1/14:0, d16:1/16:0) / cortisone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X273_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015735.X273_cat2), c("X100015735.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015735.X273_cat2), c("X100015735.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 8. X100015744/X273 
+```{r}
+# 8. Cer26_1d18_1.S8_steroid = Cer26_1d18_1/cortisone ~ X100015744/X273 - maybe OK
+# X100015744.X273 = ceramide (d18:2/24:1, d18:1/24:2)*/cortisone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015744.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015744 + X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015744.X273, na.rm = T)
+vTert
+pheno_tmp$X100015744.X273_quantile = with(pheno_tmp, 
+                                                 cut(X100015744.X273, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015744.X273_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015744.X273_cat2 <- with(pheno_tmp, ifelse(X100015744.X273_quantile == "Q1", "Q1", ifelse(X100015744.X273_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015744.X273_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X273_cat2, data = pheno_tmp)
+print(fit)
+
+gs8 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:2/24:1, d18:1/24:2) / cortisone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X273_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015744.X273_cat2), c("X100015744.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015744.X273_cat2), c("X100015744.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 9. X100015752/X273
+```{r}
+# 9. HexCer24_1.S8_steroid = HexCer24_1/cortisone ~ X100015752/X273 - OK
+# X100015752.X273 = HexCer(d18:1/24:1)/cortisone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015752.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015752 + X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015752.X273, na.rm = T)
+vTert
+pheno_tmp$X100015752.X273_quantile = with(pheno_tmp, 
+                                                 cut(X100015752.X273, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015752.X273_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015752.X273_cat2 <- with(pheno_tmp, ifelse(X100015752.X273_quantile == "Q1", "Q1", ifelse(X100015752.X273_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015752.X273_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X273_cat2, data = pheno_tmp)
+print(fit)
+
+gs9 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "HexCer(d18:1/24:1) / cortisone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X273_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015752.X273_cat2), c("X100015752.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015752.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015752.X273_cat2), c("X100015752.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015752.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 10. X100006290/X273
+```{r}
+# 10. SM20_d18_1.S8_steroid = SM20_d18_1/cortisone ~ X100006290/X273 - OK
+# X100006290.X273 = sphingomyelin (d18:1/20:0, d16:1/22:0)*/cortisone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100006290.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100006290 + X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100006290.X273, na.rm = T)
+vTert
+pheno_tmp$X100006290.X273_quantile = with(pheno_tmp, 
+                                                 cut(X100006290.X273, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100006290.X273_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100006290.X273_cat2 <- with(pheno_tmp, ifelse(X100006290.X273_quantile == "Q1", "Q1", ifelse(X100006290.X273_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100006290.X273_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X273_cat2, data = pheno_tmp)
+print(fit)
+
+gs10 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "SM(d18:1/20:0, d16:1/22:0) / cortisone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X273_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100006290.X273_cat2), c("X100006290.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100006290.X273_cat2), c("X100006290.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 11. X313/X273
+```{r}
+# 11. Spad18_0.S8_steroid = Spad18_0/cortisone ~ X313/X273 - OK
+# X313.X273 = sphinganine/cortisone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X313.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X313 + X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X313.X273, na.rm = T)
+vTert
+pheno_tmp$X313.X273_quantile = with(pheno_tmp, 
+                                                 cut(X313.X273, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X313.X273_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X313.X273_cat2 <- with(pheno_tmp, ifelse(X313.X273_quantile == "Q1", "Q1", ifelse(X313.X273_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X313.X273_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X273_cat2, data = pheno_tmp)
+print(fit)
+
+gs11 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Sphinganine / cortisone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X273_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X273 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X313.X273_cat2), c("X313.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X313.X273_cat2), c("X313.X273_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X273_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 12. X100015735/X272
+```{r}
+# 12. Cer20_1d18_1.S6_steroid = Cer20_1d18_1/corticosterone ~ X100015735/X272 - OK
+# X100015735.X272 = ceramide (d18:1/14:0, d16:1/16:0)*/corticosterone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015735.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015735 + X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015735.X272, na.rm = T)
+vTert
+pheno_tmp$X100015735.X272_quantile = with(pheno_tmp, 
+                                                 cut(X100015735.X272, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015735.X272_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015735.X272_cat2 <- with(pheno_tmp, ifelse(X100015735.X272_quantile == "Q1", "Q1", ifelse(X100015735.X272_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015735.X272_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X272_cat2, data = pheno_tmp)
+print(fit)
+
+gs12 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:1/14:0, d16:1/16:0) / corticosterone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X272_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015735.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015735.X272_cat2), c("X100015735.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015735.X272_cat2), c("X100015735.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015735.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 13. X100015744/X272
+```{r}
+# 13. Cer26_1d18_1.S6_steroid = Cer26_1d18_1/corticosterone ~ X100015744/X272 - maybe OK
+# X100015744.X272 = ceramide (d18:2/24:1, d18:1/24:2)*/corticosterone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015744.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015744 + X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015744.X272, na.rm = T)
+vTert
+pheno_tmp$X100015744.X272_quantile = with(pheno_tmp, 
+                                                 cut(X100015744.X272, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015744.X272_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015744.X272_cat2 <- with(pheno_tmp, ifelse(X100015744.X272_quantile == "Q1", "Q1", ifelse(X100015744.X272_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015744.X272_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X272_cat2, data = pheno_tmp)
+print(fit)
+
+gs13 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Cer(d18:2/24:1, d18:1/24:2) / corticosterone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X272_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015744.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015744.X272_cat2), c("X100015744.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015744.X272_cat2), c("X100015744.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015744.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 14. X100015752/X272
+```{r}
+# 14. HexCer24_1.S6_steroid = HexCer24_1/corticosterone ~ X100015752/X272 - OK
+# X100015752.X272 = HexCer(d18:1/24:1)/corticosterone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100015752.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100015752 + X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100015752.X272, na.rm = T)
+vTert
+pheno_tmp$X100015752.X272_quantile = with(pheno_tmp, 
+                                                 cut(X100015752.X272, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100015752.X272_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100015752.X272_cat2 <- with(pheno_tmp, ifelse(X100015752.X272_quantile == "Q1", "Q1", ifelse(X100015752.X272_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100015752.X272_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X272_cat2, data = pheno_tmp)
+print(fit)
+
+gs14 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "HexCer(d18:1/24:1) / corticosterone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X272_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100015752.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100015752.X272_cat2), c("X100015752.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015752.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100015752.X272_cat2), c("X100015752.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100015752.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 15. X100006290/X272
+```{r}
+# 15. SM20_d18_1.S6_steroid = SM20_d18_1/corticosterone ~ X100006290/X272 - OK
+# X100006290.X272 = sphingomyelin (d18:1/20:0, d16:1/22:0)*/corticosterone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X100006290.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X100006290 + X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X100006290.X272, na.rm = T)
+vTert
+pheno_tmp$X100006290.X272_quantile = with(pheno_tmp, 
+                                                 cut(X100006290.X272, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X100006290.X272_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X100006290.X272_cat2 <- with(pheno_tmp, ifelse(X100006290.X272_quantile == "Q1", "Q1", ifelse(X100006290.X272_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X100006290.X272_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X272_cat2, data = pheno_tmp)
+print(fit)
+
+gs15 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "SM(d18:1/20:0, d16:1/22:0) / corticosterone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X272_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X100006290.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X100006290.X272_cat2), c("X100006290.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X100006290.X272_cat2), c("X100006290.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X100006290.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cox - 16. X313/X272
+```{r}
+# 16. Spad18_0.S6_steroid = Spad18_0/corticosterone ~ X313/X272 - OK
+# X313.X272 = sphinganine/corticosterone
+
+## compare model 1) y ~ log(a/b) + covariate and 2) y ~ log(a) + log(b) + covariate
+model_1 <- lm(ocs_trim_totnum_5y_after ~ X313.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_1)
+
+model_2 <- lm(ocs_trim_totnum_5y_after ~ X313 + X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(model_2)
+
+anova(model_1, model_2)
+
+## boxplot for ratio
+## distribution
+vTert = quantile(pheno_tmp$X313.X272, na.rm = T)
+vTert
+pheno_tmp$X313.X272_quantile = with(pheno_tmp, 
+                                                 cut(X313.X272, 
+                                                 vTert, 
+                                                 include.lowest = T, 
+                                                 labels = c("Q1", "Q2", "Q3", "Q4")))
+
+pheno_tmp[, .N, .(X313.X272_quantile)][order(-N)][, pct := N/sum(N)*100] %>% print(digits = 3)
+
+pheno_tmp$X313.X272_cat2 <- with(pheno_tmp, ifelse(X313.X272_quantile == "Q1", "Q1", ifelse(X313.X272_quantile == "Q4", "Q4", NA)))
+table(pheno_tmp$X313.X272_cat2)
+
+fit <- survfit(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X272_cat2, data = pheno_tmp)
+print(fit)
+
+gs16 <- ggsurvplot(fit,
+                  conf.int = TRUE,
+                  risk.table.col = "strata", # Change risk table color by groups
+                  ggtheme = theme_bw(), # Change ggplot2 theme
+                  palette = c("#E7B800", "#2E9FDF"),
+                  legend.labs = c("Q4", "Q1"),
+                  title = "Sphinganine / corticosterone",
+                  fun = "event")
+
+### Comparing survival times between groups
+survdiff(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X272_cat2, data = pheno_tmp)
+
+## 
+cox1 <- coxph(Surv(cs_timegap_y_ocs_after, ocs_ocs_after) ~ X313.X272 + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y, data = pheno_tmp)
+summary(cox1)
+
+## mean of first OCS medication day across different ratio groups
+stats_summary_y <- pheno_tmp[!is.na(X313.X272_cat2), c("X313.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_y_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_y_ocs_after, na.rm = T),
+            median = median(cs_timegap_y_ocs_after, na.rm = T))
+
+stats_summary_y
+
+stats_summary_d <- pheno_tmp[!is.na(X313.X272_cat2), c("X313.X272_cat2", "cs_timegap_y_ocs_after", "cs_timegap_d_ocs_after")] %>%
+  group_by(X313.X272_cat2) %>%
+  summarise(mean = mean(cs_timegap_d_ocs_after, na.rm = T),
+            sd = sd(cs_timegap_d_ocs_after, na.rm = T),
+            median = median(cs_timegap_d_ocs_after, na.rm = T))
+
+stats_summary_d
+```
+
+#### Cum Plot
+```{r}
+png(filename = str_c(fig_dir, "ODOLLFA_predictors_cum_plot.png"), width = 22, height = 11, units = "in", res = 300)
+grid.arrange(gs1$plot, gs2$plot, gs3$plot, gs4$plot, gs5$plot, gs6$plot, gs7$plot,
+             gs8$plot, gs9$plot, gs10$plot, gs11$plot, gs12$plot, gs13$plot, gs14$plot,
+             gs15$plot, gs16$plot,
+             nrow=3, ncol=7)
+dev.off()
+```
+
+### 4.1.3 microb/str
+```{r}
+list_analysis <- colnames(df_microb_str_ratio[,-1])
+length(list_analysis) #5428
+
+# list_tmp <- append("Biobank_Subject_ID", list_analysis)
+df_microb_str_ratio_log$Biobank_Subject_ID <- as.integer(df_microb_str_ratio_log$Biobank_Subject_ID)
+pheno_tmp <- merge(dat_tmp, df_microb_str_ratio_log, by = "Biobank_Subject_ID", all.y = T)
+
+res_4.1.3 <- poiss_res_fnc(outc = "ocs_trim_totnum_5y_after", 
+                           mets_list = list_analysis, 
+                           dat = "pheno_tmp", 
+                           add_covar = " + Age_at_collect + BMI_most_recent + Gender + race + ics_trim_totnum_5y")
+
+## Save results
+res_ocs_use_after_microb_str_ratio <- res_4.1.3
+res_ocs_use_after_microb_str_ratio <- res_ocs_use_after_microb_str_ratio %>% separate(Name, sep = "\\.", c("numerator", "denominator"), remove = F)
+
+dict <- mets_info_updated[,c("Name", "CHEMICAL_NAME", "SUB_PATHWAY", "SUPER_PATHWAY")]
+res_ocs_use_after_microb_str_ratio$numerator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_microb_str_ratio$numerator, dict$Name)]
+res_ocs_use_after_microb_str_ratio$numerator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_microb_str_ratio$numerator, dict$CHEMICAL_NAME)]
+
+res_ocs_use_after_microb_str_ratio$denominator <- dict$CHEMICAL_NAME[match(res_ocs_use_after_microb_str_ratio$denominator, dict$Name)]
+res_ocs_use_after_microb_str_ratio$denominator_sub_pathway <- dict$SUB_PATHWAY[match(res_ocs_use_after_microb_str_ratio$denominator, dict$CHEMICAL_NAME)]
+
+setcolorder(res_ocs_use_after_microb_str_ratio, c("Name", "numerator", "numerator_sub_pathway", "denominator", "denominator_sub_pathway"))
+
+
+saveRDS(res_ocs_use_after_microb_str_ratio, file = here(res_dir, "res_ocs_use_after_microb_str_ratio.rds"))
+
+
+## manhattan plot
+# res_ocs_use_after_microb_str_ratio$direction_of_effect <- with(res_ocs_use_after_microb_str_ratio, ifelse(beta < 0, "-", "+"))
+# res_ocs_use_after_microb_str_ratio$CHEMICAL_NAME <- paste(res_ocs_use_after_microb_str_ratio$numerator, res_ocs_use_after_microb_str_ratio$denominator, sep = "/")
+# 
+# res_ocs_use_after_microb_str_ratio <- res_ocs_use_after_microb_str_ratio[order(denominator_sub_pathway, numerator_sub_pathway, Name)]
+# res_ocs_use_after_microb_str_ratio$numerator_sub_pathway <- factor(res_ocs_use_after_microb_str_ratio$numerator_sub_pathway, 
+#                                               levels = as.vector(unique(res_ocs_use_after_microb_str_ratio$numerator_sub_pathway)))
+# res_ocs_use_after_microb_str_ratio$Name <- factor(res_ocs_use_after_microb_str_ratio$Name, levels = as.vector(res_ocs_use_after_microb_str_ratio$Name))
+# 
+# save_manh_plot(dat = res_ocs_use_after_microb_str_ratio, 
+#                title_infig = "sphingolipid/steroid metabolite ratio association results (ocs_use_after asthma vs non ocs_use_after asthma)", 
+#                fig_name = "/res_ocs_use_after_microb_str_ratio.png", 
+#                if_lbl = T, lbl_thld = 5e-4, wdth = 36)
+
+# res_ocs_use_after_microb_str_ratio_fdr_sig <- res_ocs_use_after_microb_str_ratio[fdr <= 0.05]
+# res_ocs_use_after_microb_str_ratio_fdr_sig <- res_ocs_use_after_microb_str_ratio[pval <= 0.05]
+
+## display results
+datatable(res_ocs_use_after_microb_str_ratio[fdr <= 0.05], 
+          filter = "top") %>% 
+          formatSignif(columns = c("beta", "pval", "fdr","se", "zval", "neg_log10_pval"), digits = 3)
+```
+
+
+# Session info
+
+```{r}
+
+sessionInfo()
+
+```
+
